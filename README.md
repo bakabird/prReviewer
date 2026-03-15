@@ -50,12 +50,75 @@ export PR_REVIEWER_BASE_URL="https://api.openai.com/v1"
 export PR_REVIEWER_MODEL="gpt-4.1-mini"
 ```
 
+## Demo TODO checklist (end-to-end)
+
+Use this as a copy-paste runbook for a live demo.
+
+- [ ] 1. Open repo and activate environment
+  ```bash
+  cd /Users/noahsyrdal/prReviewer
+  python -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  ```
+
+- [ ] 2. Configure API access
+  ```bash
+  export PR_REVIEWER_API_KEY="your_api_key"
+  export PR_REVIEWER_BASE_URL="https://api.openai.com/v1"
+  ```
+
+- [ ] 3. Sanity check CLI
+  ```bash
+  python -m pr_reviewer --help
+  python -m pr_reviewer review --help
+  ```
+
+- [ ] 4. Run built-in real-project demo patch (`travelSync`)
+  ```bash
+  python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --format text --color always
+  ```
+
+- [ ] 5. Save shareable markdown output
+  ```bash
+  python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --format markdown --save /tmp/pr-review-demo.md
+  ```
+
+- [ ] 6. Run on your own current project changes (staged diff)
+  ```bash
+  cd /path/to/your/project
+  git add -p
+  git diff --cached > /tmp/my_project_demo.patch
+  cd /Users/noahsyrdal/prReviewer
+  python -m pr_reviewer review /tmp/my_project_demo.patch --mode multi --format text --color always
+  ```
+
+- [ ] 7. Optional: dry-run inline PR comments (safe integration demo)
+  ```bash
+  python -m pr_reviewer review /tmp/my_project_demo.patch \
+    --mode multi \
+    --post github \
+    --repo owner/repo \
+    --pr 123 \
+    --dry-run-post
+  ```
+
+- [ ] 8. Optional: post real inline comments
+  ```bash
+  export GITHUB_TOKEN="ghp_xxx"
+  python -m pr_reviewer review /tmp/my_project_demo.patch \
+    --mode multi \
+    --post github \
+    --repo owner/repo \
+    --pr 123
+  ```
+
 ## Core usage
 
 Review a patch file:
 
 ```bash
-python -m pr_reviewer review examples/sample.diff
+python -m pr_reviewer review examples/travelsync_demo.patch --mode multi
 ```
 
 Review current working diff:
@@ -73,19 +136,19 @@ python -m pr_reviewer review --cached
 Run multi-pass review:
 
 ```bash
-python -m pr_reviewer review examples/sample.diff --mode multi
+python -m pr_reviewer review examples/travelsync_demo.patch --mode multi
 ```
 
 Compact terminal output:
 
 ```bash
-python -m pr_reviewer review examples/sample.diff --compact --color always
+python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --compact --color always
 ```
 
 Save markdown output:
 
 ```bash
-python -m pr_reviewer review examples/sample.diff --format markdown --save review.md
+python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --format markdown --save review.md
 ```
 
 ## Posting findings to PR/MR
@@ -122,8 +185,8 @@ python -m pr_reviewer review --cached --post github --repo owner/repo --pr 123 -
 
 ## Strong demo assets
 
-- Sample diff: [`examples/sample.diff`](./examples/sample.diff)
-- Sample output: [`examples/sample_output.md`](./examples/sample_output.md)
+- Real project demo diff (travelSync): [`examples/travelsync_demo.patch`](./examples/travelsync_demo.patch)
+- Real project demo output (terminal): [`examples/travelsync_demo_output.txt`](./examples/travelsync_demo_output.txt)
 
 ## CLI synopsis
 
@@ -176,4 +239,3 @@ pytest -q
 - Add local policy/rule packs per repo
 - Add GitHub Checks / GitLab pipeline summary mode
 - Add consensus mode (compare two models, merge intersection)
-# prReviewer

@@ -1,0 +1,40 @@
+PR Review
+=========
+Verdict       : NEEDS ATTENTION
+Review mode   : multi
+Files changed : 3
+Diff churn    : +273 / -0
+Findings      : 3 (high: 0, medium: 3, low: 0)
+Model         : gpt-4.1-mini
+Generated     : 2026-03-15 05:59 UTC
+Passes        : correctness, security, performance
+Changed files: trip-sync/src/app/api/trips/[tripId]/booking-receipt/route.ts, trip-sync/src/app/api/trips/[tripId]/confirm-booking/route.ts, trip-sync/src/app/api/trips/[tripId]/finalize-book/route.ts
+
+Summary
+-------
+Multi-pass review (correctness, security, performance) surfaced 3 unique findings (high: 0, medium: 3, low: 0). Top risks: Multiple queries to fetch trip options could be optimized; Separate query to fetch profile for confirmedBy user; Multiple updates in confirm-booking route done via upsert with onConflict.
+
+Findings
+--------
+File: (general)
+---------------
+1. [MEDIUM] [performance] Multiple queries to fetch trip options could be optimized
+Category: performance
+Line: 26
+Confidence: 0.85
+Why it matters: Each route queries the 'trip_options' table separately and filters results in application code. This can lead to unnecessary data transfer and processing. Filtering directly in the database query could reduce data volume and improve performance.
+Suggested fix: Add filtering conditions in the database query to only fetch relevant trip options (e.g., type and status) instead of fetching all and filtering in code.
+
+2. [MEDIUM] [performance] Separate query to fetch profile for confirmedBy user
+Category: performance
+Line: 56
+Confidence: 0.80
+Why it matters: In the booking-receipt route, a separate query fetches the profile full_name for the user who confirmed the booking. This adds an extra round trip to the database and could be optimized by joining or batching queries.
+Suggested fix: Consider fetching the confirmedBy user's name in the initial query or batch fetching profiles for multiple users if applicable.
+
+3. [MEDIUM] [performance] Multiple updates in confirm-booking route done via upsert with onConflict
+Category: performance
+Line: 70
+Confidence: 0.75
+Why it matters: The confirm-booking route performs an upsert for each booked option individually in a single call, which may be acceptable but could be costly if many options exist. Bulk update or a single query with a WHERE clause might be more efficient.
+Suggested fix: If supported, use a bulk update query with a WHERE clause to update all relevant trip_options in one database operation.

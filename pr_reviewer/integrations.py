@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+import requests
+
+from .models import ReviewFinding, ReviewResult
+from .parsing import normalize_diff_path, parse_unified_diff
+
+
+class IntegrationError(RuntimeError):
+    pass
+
+
+@dataclass
+class PostingReport:
+    platform: str
+    attempted: int = 0
+    posted: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+def post_findings(
+    *,
+    platform: str,
+    result: ReviewResult,
+    diff_text: str,
+    repo: str | None,
+    pr_number: int | None,
+    mr_iid: int | None,
+    token: str | None,
+    base_url: str | None,
+    dry_run: bool = False,
+) -> PostingReport:
+    parsed_diff = parse_unified_diff(diff_text)
+
+    if platform == "github":
+        return _post_to_github(
+            result=result,
+            parsed_diff=parsed_diff,
+            repo=repo,
+            pr_number=pr_number,
+            token=token or os.getenv("GITHUB_TOKEN"),
+            base_url=base_url or "https://api.github.com",
+            dry_run=dry_run,
+        )
+
+    if platform == "gitlab":
+        return _post_to_gitlab(
+            result=result,
+            parsed_diff=parsed_diff,
+            repo=repo,
+            mr_iid=mr_iid,
+            token=token or os.getenv("GITLAB_TOKEN"),
+            base_url=base_url or "https://gitlab.com/api/v4",
+            dry_run=dry_run,
+        )
+
+    raise IntegrationError(f"Unsupported platform: {platform}")
+
+
+def _post_to_github(
+    *,
+    result: ReviewResult,
+    parsed_diff,
+    repo: str | None,
+    pr_number: int | None,
+    token: str | None,
+    base_url: str,
+    dry_run: bool,
+) -> PostingReport:
+    if not repo:
+        raise IntegrationError("GitHub posting requires --repo owner/name")
+    if not pr_number:
+        raise IntegrationError("GitHub posting requires --pr <number>")
+
+    report = PostingReport(platform="github")
+
+    if dry_run:
+        for _ in _iter_postable_findings(result, parsed_diff):
+            report.attempted += 1
+            report.posted += 1
+        return report
+
+    if not token:
+        raise IntegrationError("Missing GitHub token. Set --integration-token or GITHUB_TOKEN.")
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        }
+    )
+
+    pr_url = f"{base_url.rstrip('/')}/repos/{repo}/pulls/{pr_number}"
+    pr_response = session.get(pr_url, timeout=30)
+    if pr_response.status_code >= 400:
+        raise IntegrationError(f"GitHub PR lookup failed ({pr_response.status_code}): {pr_response.text}")
+
+    pr_payload = pr_response.json()
+    head_sha = pr_payload.get("head", {}).get("sha")
+    if not head_sha:
+        raise IntegrationError("Could not resolve GitHub PR head SHA.")
+
+    for finding in _iter_postable_findings(result, parsed_diff):
+        report.attempted += 1
+
+        payload = {
+            "body": _build_comment_body(finding),
+            "path": normalize_diff_path(finding.file or ""),
+            "line": finding.line,
+            "side": "RIGHT",
+            "commit_id": head_sha,
+        }
+        comment_url = f"{base_url.rstrip('/')}/repos/{repo}/pulls/{pr_number}/comments"
+        response = session.post(comment_url, json=payload, timeout=30)
+
+        if response.status_code in {200, 201}:
+            report.posted += 1
+            continue
+
+        if response.status_code == 422:
+            report.skipped += 1
+            report.errors.append(
+                f"Skipped {finding.file}:{finding.line} ({finding.title}): GitHub rejected comment position."
+            )
+            continue
+
+        report.errors.append(
+            f"GitHub comment failed for {finding.file}:{finding.line} ({finding.title}) "
+            f"[{response.status_code}]."
+        )
+
+    return report
+
+
+def _post_to_gitlab(
+    *,
+    result: ReviewResult,
+    parsed_diff,
+    repo: str | None,
+    mr_iid: int | None,
+    token: str | None,
+    base_url: str,
+    dry_run: bool,
+) -> PostingReport:
+    if not repo:
+        raise IntegrationError("GitLab posting requires --repo <project-id-or-path>")
+    if not mr_iid:
+        raise IntegrationError("GitLab posting requires --mr <iid>")
+
+    report = PostingReport(platform="gitlab")
+
+    if dry_run:
+        for _ in _iter_postable_findings(result, parsed_diff):
+            report.attempted += 1
+            report.posted += 1
+        return report
+
+    if not token:
+        raise IntegrationError("Missing GitLab token. Set --integration-token or GITLAB_TOKEN.")
+
+    project_ref = requests.utils.quote(repo, safe="")
+    root = base_url.rstrip("/")
+
+    session = requests.Session()
+    session.headers.update({"PRIVATE-TOKEN": token, "Content-Type": "application/json"})
+
+    versions_url = f"{root}/projects/{project_ref}/merge_requests/{mr_iid}/versions"
+    versions_response = session.get(versions_url, timeout=30)
+    if versions_response.status_code >= 400:
+        raise IntegrationError(
+            f"GitLab MR versions lookup failed ({versions_response.status_code}): {versions_response.text}"
+        )
+
+    versions = versions_response.json()
+    if not versions:
+        raise IntegrationError("GitLab MR has no available diff versions for inline comments.")
+
+    latest = versions[0]
+    base_sha = latest.get("base_commit_sha")
+    start_sha = latest.get("start_commit_sha")
+    head_sha = latest.get("head_commit_sha")
+    if not (base_sha and start_sha and head_sha):
+        raise IntegrationError("Could not resolve GitLab MR diff version SHAs.")
+
+    discussions_url = f"{root}/projects/{project_ref}/merge_requests/{mr_iid}/discussions"
+
+    for finding in _iter_postable_findings(result, parsed_diff):
+        report.attempted += 1
+
+        payload = {
+            "body": _build_comment_body(finding),
+            "position": {
+                "position_type": "text",
+                "base_sha": base_sha,
+                "start_sha": start_sha,
+                "head_sha": head_sha,
+                "new_path": normalize_diff_path(finding.file or ""),
+                "new_line": finding.line,
+            },
+        }
+        response = session.post(discussions_url, json=payload, timeout=30)
+
+        if response.status_code in {200, 201}:
+            report.posted += 1
+            continue
+
+        if response.status_code in {400, 422}:
+            report.skipped += 1
+            report.errors.append(
+                f"Skipped {finding.file}:{finding.line} ({finding.title}): GitLab rejected comment position."
+            )
+            continue
+
+        report.errors.append(
+            f"GitLab comment failed for {finding.file}:{finding.line} ({finding.title}) "
+            f"[{response.status_code}]."
+        )
+
+    return report
+
+
+def _iter_postable_findings(result: ReviewResult, parsed_diff):
+    for finding in result.findings:
+        if not finding.file or not finding.line:
+            continue
+
+        normalized = normalize_diff_path(finding.file)
+        on_changed_line = finding.on_changed_line
+        if on_changed_line is None:
+            on_changed_line = finding.line in parsed_diff.changed_new_lines.get(normalized, set())
+
+        if not on_changed_line:
+            continue
+
+        yield finding
+
+
+def _build_comment_body(finding: ReviewFinding) -> str:
+    lines = [
+        f"**[{finding.severity.value.upper()}][{finding.category.value}] {finding.title}**",
+        f"Confidence: {finding.confidence:.2f}",
+        "",
+        f"Why it matters: {finding.explanation}",
+    ]
+
+    if finding.suggested_fix:
+        lines.append(f"Suggested fix: {finding.suggested_fix}")
+
+    if finding.code_frame:
+        lines.extend(["", "Code frame:", "```text", finding.code_frame, "```"])
+
+    return "\n".join(lines)

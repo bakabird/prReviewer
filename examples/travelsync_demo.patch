@@ -1,0 +1,291 @@
+diff --git a/trip-sync/src/app/api/trips/[tripId]/booking-receipt/route.ts b/trip-sync/src/app/api/trips/[tripId]/booking-receipt/route.ts
+new file mode 100644
+index 0000000..6d98143
+--- /dev/null
++++ b/trip-sync/src/app/api/trips/[tripId]/booking-receipt/route.ts
+@@ -0,0 +1,96 @@
++import { NextResponse } from "next/server";
++import { createServerClient } from "@/lib/supabaseServer";
++import { checkTripAccess } from "@/lib/tripAccess";
++import { createClient } from "@supabase/supabase-js";
++
++export async function GET(
++  _req: Request,
++  { params }: { params: Promise<{ tripId: string }> },
++) {
++  try {
++    const supabase = await createServerClient();
++    const {
++      data: { user },
++    } = await supabase.auth.getUser();
++    if (!user) {
++      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++    }
++
++    const { tripId } = await params;
++    const access = await checkTripAccess(supabase, tripId, user.id);
++    if (!access.hasAccess) {
++      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
++    }
++
++    const { data: options, error } = await supabase
++      .from("trip_options")
++      .select("id, type, status, metadata")
++      .eq("trip_id", tripId);
++
++    if (error) {
++      console.error(error);
++      return NextResponse.json(
++        { error: "Failed to load options" },
++        { status: 500 },
++      );
++    }
++
++    const booked = (options || []).find((opt: any) => {
++      const status = opt.status || opt.metadata?.status;
++      return (
++        (opt.type === "flight" || opt.type === "housing") &&
++        status === "booked" &&
++        (opt.metadata?.booking_receipt_path || opt.metadata?.booking_receipt_url)
++      );
++    });
++
++    if (!booked) {
++      return NextResponse.json({ receipt_url: null });
++    }
++
++    const receiptUrl = booked.metadata?.booking_receipt_url || null;
++    const receiptPath = booked.metadata?.booking_receipt_path || null;
++    const confirmedBy = booked.metadata?.booking_confirmed_by || null;
++    const confirmedAt = booked.metadata?.booking_confirmed_at || null;
++
++    let confirmedByName: string | null = null;
++    if (confirmedBy) {
++      const { data: profile } = await supabase
++        .from("profiles")
++        .select("full_name")
++        .eq("id", confirmedBy)
++        .single();
++      confirmedByName = profile?.full_name || null;
++    }
++
++    if (!receiptPath) {
++      return NextResponse.json({
++        receipt_url: receiptUrl,
++        confirmed_by: confirmedByName,
++        confirmed_at: confirmedAt,
++      });
++    }
++
++    const serviceUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
++    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
++    const admin =
++      serviceUrl && serviceKey ? createClient(serviceUrl, serviceKey) : null;
++    const storageClient = admin ? admin.storage : supabase.storage;
++
++    const { data } = await storageClient
++      .from("trip-receipts")
++      .createSignedUrl(receiptPath, 60 * 60);
++
++    return NextResponse.json({
++      receipt_url: data?.signedUrl || receiptUrl,
++      confirmed_by: confirmedByName,
++      confirmed_at: confirmedAt,
++    });
++  } catch (err) {
++    console.error(err);
++    return NextResponse.json(
++      { error: "Failed to load booking receipt" },
++      { status: 500 },
++    );
++  }
++}
+diff --git a/trip-sync/src/app/api/trips/[tripId]/confirm-booking/route.ts b/trip-sync/src/app/api/trips/[tripId]/confirm-booking/route.ts
+new file mode 100644
+index 0000000..74edde1
+--- /dev/null
++++ b/trip-sync/src/app/api/trips/[tripId]/confirm-booking/route.ts
+@@ -0,0 +1,105 @@
++import { NextResponse } from "next/server";
++import { createServerClient } from "@/lib/supabaseServer";
++import { checkTripAccess } from "@/lib/tripAccess";
++
++export async function POST(
++  req: Request,
++  { params }: { params: Promise<{ tripId: string }> },
++) {
++  try {
++    const supabase = await createServerClient();
++    const {
++      data: { user },
++    } = await supabase.auth.getUser();
++
++    if (!user) {
++      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++    }
++
++    const { tripId } = await params;
++    const access = await checkTripAccess(supabase, tripId, user.id);
++    if (!access.hasAccess) {
++      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
++    }
++
++    const body = await req.json().catch(() => ({}));
++    const bookingReceiptPath = body?.booking_receipt_path || null;
++    const bookingReceiptUrl = body?.booking_receipt_url || null;
++
++    const { data: options, error } = await supabase
++      .from("trip_options")
++      .select("id, type, status, metadata")
++      .eq("trip_id", tripId);
++
++    if (error) {
++      console.error(error);
++      return NextResponse.json(
++        { error: "Failed to load options" },
++        { status: 500 },
++      );
++    }
++
++    const isBooked = (opt: any) =>
++      opt.status === "booked" || opt.metadata?.status === "booked";
++
++    const bookedOptions = (options || []).filter(
++      (opt: any) => (opt.type === "flight" || opt.type === "housing") && isBooked(opt),
++    );
++
++    if (bookedOptions.length === 0) {
++      return NextResponse.json(
++        { error: "No booked flight or housing to confirm" },
++        { status: 400 },
++      );
++    }
++
++    const now = new Date().toISOString();
++    const updates = bookedOptions.map((opt: any) => ({
++      id: opt.id,
++      metadata: {
++        ...(opt.metadata || {}),
++        booking_confirmed_at: now,
++        booking_confirmed_by: user.id,
++        booking_receipt_path: bookingReceiptPath,
++        booking_receipt_url: bookingReceiptUrl,
++      },
++    }));
++
++    const { error: updateError } = await supabase
++      .from("trip_options")
++      .upsert(updates, { onConflict: "id" });
++
++    if (updateError) {
++      console.error(updateError);
++      return NextResponse.json(
++        { error: "Failed to confirm booking" },
++        { status: 500 },
++      );
++    }
++
++    const title = "Booking confirmed";
++    const message = bookingReceiptPath || bookingReceiptUrl
++      ? "Booking confirmed and receipt uploaded."
++      : "Your group confirmed bookings for this trip.";
++    const url = `/trips/${tripId}`;
++    await supabase.from("trip_notifications").insert({
++      trip_id: tripId,
++      type: "booking_confirmed",
++      title,
++      message,
++      url,
++      metadata: {
++        confirmed_at: now,
++      },
++      recorded_at: now,
++    });
++
++    return NextResponse.json({ success: true });
++  } catch (err) {
++    console.error(err);
++    return NextResponse.json(
++      { error: "Failed to confirm booking" },
++      { status: 500 },
++    );
++  }
++}
+diff --git a/trip-sync/src/app/api/trips/[tripId]/finalize-book/route.ts b/trip-sync/src/app/api/trips/[tripId]/finalize-book/route.ts
+new file mode 100644
+index 0000000..002c47b
+--- /dev/null
++++ b/trip-sync/src/app/api/trips/[tripId]/finalize-book/route.ts
+@@ -0,0 +1,72 @@
++import { NextResponse } from "next/server";
++import { createServerClient } from "@/lib/supabaseServer";
++import { checkTripAccess } from "@/lib/tripAccess";
++
++export async function POST(
++  _req: Request,
++  { params }: { params: Promise<{ tripId: string }> },
++) {
++  try {
++    const supabase = await createServerClient();
++    const {
++      data: { user },
++    } = await supabase.auth.getUser();
++    if (!user) {
++      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++    }
++
++    const { tripId } = await params;
++    const access = await checkTripAccess(supabase, tripId, user.id);
++    if (!access.hasAccess) {
++      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
++    }
++
++    const { data: options, error } = await supabase
++      .from("trip_options")
++      .select("id, type, status, metadata")
++      .eq("trip_id", tripId);
++
++    if (error) {
++      console.error(error);
++      return NextResponse.json({ error: "Failed to load options" }, { status: 500 });
++    }
++
++    const isFinal = (opt: any) =>
++      opt.status === "final" || opt.metadata?.status === "final";
++
++    const finalOptions = (options || []).filter(
++      (opt: any) => (opt.type === "flight" || opt.type === "housing") && isFinal(opt),
++    );
++
++    if (finalOptions.length === 0) {
++      return NextResponse.json(
++        { error: "No final flight or housing selected" },
++        { status: 400 },
++      );
++    }
++
++    const updates = finalOptions.map((opt: any) => ({
++      id: opt.id,
++      status: "booked",
++      metadata: {
++        ...(opt.metadata || {}),
++        status: "booked",
++        booked_at: new Date().toISOString(),
++      },
++    }));
++
++    const { error: updateError } = await supabase
++      .from("trip_options")
++      .upsert(updates, { onConflict: "id" });
++
++    if (updateError) {
++      console.error(updateError);
++      return NextResponse.json({ error: "Failed to mark booked" }, { status: 500 });
++    }
++
++    return NextResponse.json({ success: true });
++  } catch (err) {
++    console.error(err);
++    return NextResponse.json({ error: "Failed to book" }, { status: 500 });
++  }
++}
