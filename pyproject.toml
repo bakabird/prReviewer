@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pr-reviewer"
+version = "0.1.0"
+description = "LLM-powered CLI for structured PR review"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.6,<3",
+  "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+]
+
+[project.scripts]
+pr-reviewer = "pr_reviewer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pr_reviewer*"]

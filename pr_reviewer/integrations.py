@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 import requests
 
+from . import __version__
 from .models import ReviewFinding, ReviewResult
 from .parsing import normalize_diff_path, parse_unified_diff
 
@@ -77,9 +78,11 @@ def _post_to_github(
         raise IntegrationError("GitHub posting requires --pr <number>")
 
     report = PostingReport(platform="github")
+    postable_findings, skipped_before_post = _collect_postable_findings(result, parsed_diff)
+    report.skipped += skipped_before_post
 
     if dry_run:
-        for _ in _iter_postable_findings(result, parsed_diff):
+        for _ in postable_findings:
             report.attempted += 1
             report.posted += 1
         return report
@@ -93,6 +96,7 @@ def _post_to_github(
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
+            "User-Agent": f"pr-reviewer/{__version__}",
         }
     )
 
@@ -106,7 +110,7 @@ def _post_to_github(
     if not head_sha:
         raise IntegrationError("Could not resolve GitHub PR head SHA.")
 
-    for finding in _iter_postable_findings(result, parsed_diff):
+    for finding in postable_findings:
         report.attempted += 1
 
         payload = {
@@ -154,9 +158,11 @@ def _post_to_gitlab(
         raise IntegrationError("GitLab posting requires --mr <iid>")
 
     report = PostingReport(platform="gitlab")
+    postable_findings, skipped_before_post = _collect_postable_findings(result, parsed_diff)
+    report.skipped += skipped_before_post
 
     if dry_run:
-        for _ in _iter_postable_findings(result, parsed_diff):
+        for _ in postable_findings:
             report.attempted += 1
             report.posted += 1
         return report
@@ -168,7 +174,13 @@ def _post_to_gitlab(
     root = base_url.rstrip("/")
 
     session = requests.Session()
-    session.headers.update({"PRIVATE-TOKEN": token, "Content-Type": "application/json"})
+    session.headers.update(
+        {
+            "PRIVATE-TOKEN": token,
+            "Content-Type": "application/json",
+            "User-Agent": f"pr-reviewer/{__version__}",
+        }
+    )
 
     versions_url = f"{root}/projects/{project_ref}/merge_requests/{mr_iid}/versions"
     versions_response = session.get(versions_url, timeout=30)
@@ -190,7 +202,7 @@ def _post_to_gitlab(
 
     discussions_url = f"{root}/projects/{project_ref}/merge_requests/{mr_iid}/discussions"
 
-    for finding in _iter_postable_findings(result, parsed_diff):
+    for finding in postable_findings:
         report.attempted += 1
 
         payload = {
@@ -225,9 +237,16 @@ def _post_to_gitlab(
     return report
 
 
-def _iter_postable_findings(result: ReviewResult, parsed_diff):
+def _collect_postable_findings(
+    result: ReviewResult,
+    parsed_diff,
+) -> tuple[list[ReviewFinding], int]:
+    postable: list[ReviewFinding] = []
+    skipped = 0
+
     for finding in result.findings:
         if not finding.file or not finding.line:
+            skipped += 1
             continue
 
         normalized = normalize_diff_path(finding.file)
@@ -236,9 +255,12 @@ def _iter_postable_findings(result: ReviewResult, parsed_diff):
             on_changed_line = finding.line in parsed_diff.changed_new_lines.get(normalized, set())
 
         if not on_changed_line:
+            skipped += 1
             continue
 
-        yield finding
+        postable.append(finding)
+
+    return postable, skipped
 
 
 def _build_comment_body(finding: ReviewFinding) -> str:

@@ -255,6 +255,20 @@ def truncate_diff(diff_text: str, max_lines: int) -> tuple[str, bool, int]:
     if original_line_count <= max_lines:
         return diff_text, False, original_line_count
 
+    section_starts = [idx for idx, line in enumerate(lines) if _DIFF_HEADER_RE.match(line)]
+    if len(section_starts) > 1 and max_lines > 2:
+        distributed = _truncate_diff_sections(lines, section_starts, max_lines, original_line_count)
+        if distributed is not None:
+            return distributed, True, original_line_count
+
+    return _truncate_head_tail(lines, max_lines, original_line_count)
+
+
+def _truncate_head_tail(
+    lines: list[str],
+    max_lines: int,
+    original_line_count: int,
+) -> tuple[str, bool, int]:
     tail_count = min(120, max(20, max_lines // 3))
     head_count = max_lines - tail_count - 1
     if head_count < 1:
@@ -269,6 +283,57 @@ def truncate_diff(diff_text: str, max_lines: int) -> tuple[str, bool, int]:
         truncated_lines.extend(lines[-tail_count:])
 
     return "\n".join(truncated_lines), True, original_line_count
+
+
+def _truncate_diff_sections(
+    lines: list[str],
+    section_starts: list[int],
+    max_lines: int,
+    original_line_count: int,
+) -> str | None:
+    sections: list[list[str]] = []
+    for idx, start in enumerate(section_starts):
+        end = section_starts[idx + 1] if idx + 1 < len(section_starts) else len(lines)
+        section = lines[start:end]
+        if section:
+            sections.append(section)
+
+    if len(sections) < 2:
+        return None
+
+    content_budget = max_lines - 1
+    if content_budget < len(sections):
+        return None
+
+    take_counts = [min(len(section), content_budget // len(sections)) for section in sections]
+    used = sum(take_counts)
+    remaining = content_budget - used
+
+    while remaining > 0:
+        progressed = False
+        for idx, section in enumerate(sections):
+            if take_counts[idx] >= len(section):
+                continue
+            take_counts[idx] += 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            break
+
+    distributed_lines: list[str] = []
+    for section, take_count in zip(sections, take_counts):
+        distributed_lines.extend(section[:take_count])
+
+    if len(distributed_lines) >= original_line_count:
+        return None
+
+    distributed_lines.append(
+        "# ... diff truncated: showing distributed excerpts across "
+        f"{len(sections)} file sections out of {original_line_count} total lines ..."
+    )
+    return "\n".join(distributed_lines)
 
 
 def _register_file(file_path: str, files: list[str], seen_files: set[str]) -> None:

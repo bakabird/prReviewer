@@ -34,8 +34,10 @@ Most AI code-review demos are either vague or overbuilt. `pr-reviewer` optimizes
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e '.[dev]'
 ```
+
+After installation, you can use either `pr-reviewer ...` or `python -m pr_reviewer ...`.
 
 Required environment variable:
 
@@ -59,7 +61,7 @@ Use this as a copy-paste runbook for a live demo.
   cd /Users/noahsyrdal/prReviewer
   python -m venv .venv
   source .venv/bin/activate
-  pip install -r requirements.txt
+  pip install -e '.[dev]'
   ```
 
 - [ ] 2. Configure API access
@@ -70,8 +72,8 @@ Use this as a copy-paste runbook for a live demo.
 
 - [ ] 3. Sanity check CLI
   ```bash
-  python -m pr_reviewer --help
-  python -m pr_reviewer review --help
+  pr-reviewer --help
+  pr-reviewer review --help
   ```
 
 - [ ] 4. Run built-in real-project demo patch (`travelSync`)
@@ -191,7 +193,7 @@ python -m pr_reviewer review --cached --post github --repo owner/repo --pr 123 -
 ## CLI synopsis
 
 ```text
-python -m pr_reviewer review [patch] [--stdin] [--cached]
+pr-reviewer review [patch] [--stdin] [--cached]
                              [--mode single|multi]
                              [--model MODEL]
                              [--max-lines N]

@@ -53,6 +53,17 @@ def test_truncate_diff_applies_marker_and_preserves_bounds() -> None:
     assert "diff truncated" in truncated
 
 
+def test_truncate_diff_distributes_budget_across_multiple_files() -> None:
+    truncated, was_truncated, original_count = truncate_diff(SAMPLE_DIFF, max_lines=10)
+
+    assert was_truncated is True
+    assert original_count == len(SAMPLE_DIFF.splitlines())
+    assert len(truncated.splitlines()) == 10
+    assert "diff --git a/api/user.py b/api/user.py" in truncated
+    assert "diff --git a/core/cache.py b/core/cache.py" in truncated
+    assert "distributed excerpts across 2 file sections" in truncated
+
+
 def test_build_finding_annotation_maps_to_hunk_context() -> None:
     parsed = parse_unified_diff(SAMPLE_DIFF)
 

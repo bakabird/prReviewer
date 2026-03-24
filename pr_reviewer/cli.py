@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from textwrap import dedent
 
+from . import __version__
 from .formatters import format_review
 from .llm import LLMError, OpenAICompatibleProvider, ProviderConfigError
 from .parsing import read_patch_file
@@ -28,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
             """
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -194,9 +200,16 @@ def run_review(args: argparse.Namespace) -> int:
     print(rendered)
 
     if args.save:
-        output_path = Path(args.save)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(rendered + "\n", encoding="utf-8")
+        output_path = Path(args.save).expanduser()
+        try:
+            if output_path.exists() and output_path.is_dir():
+                raise IsADirectoryError(f"{output_path} is a directory")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"error: could not save output to {output_path}: {exc}", file=sys.stderr)
+            return 1
+
         print(f"Saved output to {output_path}", file=sys.stderr)
 
     if args.post:
@@ -261,6 +274,24 @@ def _use_color(color_mode: str, output_format: str) -> bool:
 
 
 def _validate_post_args(args: argparse.Namespace) -> str | None:
+    if args.dry_run_post and not args.post:
+        return "--dry-run-post requires --post"
+
+    if args.repo and not args.post:
+        return "--repo requires --post"
+
+    if args.integration_token and not args.post:
+        return "--integration-token requires --post"
+
+    if args.integration_base_url and not args.post:
+        return "--integration-base-url requires --post"
+
+    if args.pr and args.post != "github":
+        return "--pr requires --post github"
+
+    if args.mr and args.post != "gitlab":
+        return "--mr requires --post gitlab"
+
     if not args.post:
         return None
 
@@ -270,8 +301,14 @@ def _validate_post_args(args: argparse.Namespace) -> str | None:
     if args.post == "github" and not args.pr:
         return "--post github requires --pr <number>"
 
+    if args.post == "github" and args.mr:
+        return "--post github does not accept --mr"
+
     if args.post == "gitlab" and not args.mr:
         return "--post gitlab requires --mr <iid>"
+
+    if args.post == "gitlab" and args.pr:
+        return "--post gitlab does not accept --pr"
 
     return None
 
