@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-lines",
         type=int,
         default=1200,
-        help="Hard cap on diff lines sent to the model before truncation",
+        help="Approximate per-request diff line budget before the review splits into chunks",
     )
     review_parser.add_argument(
         "--format",

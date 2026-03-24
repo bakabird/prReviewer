@@ -18,6 +18,7 @@ Most AI code-review demos are either vague or overbuilt. `pr-reviewer` optimizes
 - Review from patch file, stdin, or staged diff (`--cached`)
 - Single-pass mode (`--mode single`) and multi-pass mode (`--mode multi`)
   - `multi` runs correctness, security, and performance passes, then dedupes and merges
+- Automatic chunked review for large diffs so broad PRs keep more context than a single truncated excerpt
 - Structured findings with:
   - severity: `low|medium|high`
   - category: `bug|security|performance|maintainability`
@@ -210,6 +211,8 @@ pr-reviewer review [patch] [--stdin] [--cached]
                              [--integration-base-url URL]
                              [--dry-run-post]
 ```
+
+`--max-lines` is the approximate per-request chunk budget. Large diffs are automatically split across multiple review calls and merged back into one result.
 
 ## Project layout
 

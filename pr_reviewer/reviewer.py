@@ -16,7 +16,7 @@ from .models import (
     Severity,
     Verdict,
 )
-from .parsing import build_finding_annotation, normalize_diff_path, parse_unified_diff, truncate_diff
+from .parsing import build_finding_annotation, chunk_diff, normalize_diff_path, parse_unified_diff
 
 SYSTEM_PROMPT = """You are an expert senior software engineer performing PR review on a unified diff.
 
@@ -97,23 +97,22 @@ class PRReviewer:
         parsed_diff = parse_unified_diff(diff_text)
         stats = parsed_diff.stats
 
-        truncated_diff, was_truncated, original_line_count = truncate_diff(diff_text, max_lines=max_lines)
-        stats.truncated = was_truncated
-        stats.original_line_count = original_line_count
-        if was_truncated:
-            stats.line_count = len(truncated_diff.splitlines())
+        diff_chunks, was_chunked, original_line_count = chunk_diff(diff_text, max_lines=max_lines)
+        if was_chunked:
+            stats.original_line_count = original_line_count
 
         warnings: list[str] = []
-        if was_truncated:
+        if was_chunked:
             warnings.append(
-                f"Diff exceeded max lines ({max_lines}); review used a truncated diff excerpt."
+                f"Diff exceeded max lines ({max_lines}); review split the diff into "
+                f"{len(diff_chunks)} chunk(s) to preserve more context."
             )
         if not stats.patch_like:
             warnings.append("Input does not appear to be a standard unified diff; confidence may be lower.")
 
         if review_mode == "multi":
             return self._review_multi(
-                diff_text=truncated_diff,
+                diff_chunks=diff_chunks,
                 full_parsed_diff=parsed_diff,
                 stats=stats,
                 model=model,
@@ -121,7 +120,7 @@ class PRReviewer:
             )
 
         return self._review_single(
-            diff_text=truncated_diff,
+            diff_chunks=diff_chunks,
             full_parsed_diff=parsed_diff,
             stats=stats,
             model=model,
@@ -131,27 +130,56 @@ class PRReviewer:
     def _review_single(
         self,
         *,
-        diff_text: str,
+        diff_chunks,
         full_parsed_diff,
         stats: DiffStats,
         model: str,
         warnings: list[str],
     ) -> ReviewResult:
-        payload, raw_response, parse_warning = self._run_pass(
-            model=model,
-            pass_name="general",
-            focus=(
-                "Use a balanced review across correctness, security, performance, and maintainability. "
-                "Prefer high-signal findings."
-            ),
-            diff_text=diff_text,
-            stats=stats,
+        payloads: list[LLMReviewPayload] = []
+        raw_failures: list[str] = []
+        chunk_count = len(diff_chunks)
+        focus = (
+            "Use a balanced review across correctness, security, performance, and maintainability. "
+            "Prefer high-signal findings."
         )
 
-        if parse_warning:
-            warnings.append(parse_warning)
+        for chunk_index, diff_chunk in enumerate(diff_chunks, start=1):
+            payload, raw_response, parse_warning = self._run_pass(
+                model=model,
+                pass_name="general",
+                focus=focus,
+                diff_text=diff_chunk.diff_text,
+                stats=diff_chunk.stats,
+                full_stats=stats,
+                chunk_index=chunk_index,
+                chunk_count=chunk_count,
+            )
 
-        if payload is None:
+            if parse_warning:
+                warnings.append(
+                    _format_chunk_warning(
+                        parse_warning,
+                        pass_name="general",
+                        chunk_index=chunk_index,
+                        chunk_count=chunk_count,
+                    )
+                )
+
+            if payload is None:
+                raw_failures.append(
+                    _tag_raw_response(
+                        raw_response,
+                        pass_name="general",
+                        chunk_index=chunk_index,
+                        chunk_count=chunk_count,
+                    )
+                )
+                continue
+
+            payloads.append(payload)
+
+        if not payloads:
             fallback_finding = ReviewFinding(
                 severity=Severity.low,
                 category=Category.maintainability,
@@ -172,20 +200,37 @@ class PRReviewer:
                 review_mode="single",
                 passes_run=["general"],
                 warnings=warnings,
-                raw_response=raw_response,
+                raw_response="\n\n".join(raw_failures) if raw_failures else None,
             )
 
-        findings = self._annotate_findings(payload.findings, full_parsed_diff)
+        all_findings: list[ReviewFinding] = []
+        for payload in payloads:
+            all_findings.extend(payload.findings)
+
+        merged_findings = _dedupe_findings(all_findings)
+        deduped_count = len(all_findings) - len(merged_findings)
+        if chunk_count > 1 and deduped_count > 0:
+            warnings.append(f"Deduped {deduped_count} overlapping finding(s) across diff chunks.")
+
+        findings = self._annotate_findings(merged_findings, full_parsed_diff)
         missing_context = _count_unmapped_findings(findings)
         if missing_context:
             warnings.append(
                 f"Could not attach hunk context for {missing_context} finding(s); file/line may not map to visible hunks."
             )
 
+        sorted_findings = _sort_findings(findings)
+        if chunk_count == 1 and len(payloads) == 1:
+            summary = payloads[0].summary
+            verdict = payloads[0].verdict
+        else:
+            summary = _build_single_summary(sorted_findings, chunk_count=chunk_count)
+            verdict = _infer_verdict(sorted_findings, [payload.verdict for payload in payloads])
+
         return ReviewResult(
-            summary=payload.summary,
-            verdict=payload.verdict,
-            findings=_sort_findings(findings),
+            summary=summary,
+            verdict=verdict,
+            findings=sorted_findings,
             model=model,
             diff=stats,
             review_mode="single",
@@ -196,7 +241,7 @@ class PRReviewer:
     def _review_multi(
         self,
         *,
-        diff_text: str,
+        diff_chunks,
         full_parsed_diff,
         stats: DiffStats,
         model: str,
@@ -204,24 +249,50 @@ class PRReviewer:
     ) -> ReviewResult:
         payloads: list[tuple[str, LLMReviewPayload]] = []
         raw_failures: list[str] = []
+        chunk_count = len(diff_chunks)
+        successful_passes: list[str] = []
 
         for pass_name, focus in MULTI_PASS_FOCI:
-            payload, raw_response, parse_warning = self._run_pass(
-                model=model,
-                pass_name=pass_name,
-                focus=focus,
-                diff_text=diff_text,
-                stats=stats,
-            )
+            pass_had_success = False
 
-            if parse_warning:
-                warnings.append(f"[{pass_name}] {parse_warning}")
+            for chunk_index, diff_chunk in enumerate(diff_chunks, start=1):
+                payload, raw_response, parse_warning = self._run_pass(
+                    model=model,
+                    pass_name=pass_name,
+                    focus=focus,
+                    diff_text=diff_chunk.diff_text,
+                    stats=diff_chunk.stats,
+                    full_stats=stats,
+                    chunk_index=chunk_index,
+                    chunk_count=chunk_count,
+                )
 
-            if payload is None:
-                raw_failures.append(raw_response)
-                continue
+                if parse_warning:
+                    warnings.append(
+                        _format_chunk_warning(
+                            parse_warning,
+                            pass_name=pass_name,
+                            chunk_index=chunk_index,
+                            chunk_count=chunk_count,
+                        )
+                    )
 
-            payloads.append((pass_name, payload))
+                if payload is None:
+                    raw_failures.append(
+                        _tag_raw_response(
+                            raw_response,
+                            pass_name=pass_name,
+                            chunk_index=chunk_index,
+                            chunk_count=chunk_count,
+                        )
+                    )
+                    continue
+
+                payloads.append((pass_name, payload))
+                pass_had_success = True
+
+            if pass_had_success:
+                successful_passes.append(pass_name)
 
         if not payloads:
             fallback_finding = ReviewFinding(
@@ -254,7 +325,8 @@ class PRReviewer:
         merged_findings = _dedupe_findings(all_findings)
         deduped_count = len(all_findings) - len(merged_findings)
         if deduped_count > 0:
-            warnings.append(f"Deduped {deduped_count} overlapping finding(s) across review passes.")
+            scope = "review passes and diff chunks" if chunk_count > 1 else "review passes"
+            warnings.append(f"Deduped {deduped_count} overlapping finding(s) across {scope}.")
 
         annotated_findings = self._annotate_findings(merged_findings, full_parsed_diff)
         missing_context = _count_unmapped_findings(annotated_findings)
@@ -264,17 +336,18 @@ class PRReviewer:
             )
 
         pass_verdicts = [payload.verdict for _, payload in payloads]
-        verdict = _infer_verdict(_sort_findings(annotated_findings), pass_verdicts)
-        summary = _build_multi_summary(payloads, annotated_findings)
+        sorted_findings = _sort_findings(annotated_findings)
+        verdict = _infer_verdict(sorted_findings, pass_verdicts)
+        summary = _build_multi_summary(payloads, sorted_findings, chunk_count=chunk_count)
 
         return ReviewResult(
             summary=summary,
             verdict=verdict,
-            findings=_sort_findings(annotated_findings),
+            findings=sorted_findings,
             model=model,
             diff=stats,
             review_mode="multi",
-            passes_run=[name for name, _ in payloads],
+            passes_run=successful_passes,
             warnings=warnings,
         )
 
@@ -286,12 +359,18 @@ class PRReviewer:
         focus: str,
         diff_text: str,
         stats: DiffStats,
+        full_stats: DiffStats,
+        chunk_index: int,
+        chunk_count: int,
     ) -> tuple[LLMReviewPayload | None, str, str | None]:
         user_prompt = self._build_user_prompt(
             diff_text=diff_text,
             stats=stats,
+            full_stats=full_stats,
             pass_name=pass_name,
             focus=focus,
+            chunk_index=chunk_index,
+            chunk_count=chunk_count,
         )
 
         raw_response = self.provider.complete_json(
@@ -308,17 +387,34 @@ class PRReviewer:
         *,
         diff_text: str,
         stats: DiffStats,
+        full_stats: DiffStats,
         pass_name: str,
         focus: str,
+        chunk_index: int,
+        chunk_count: int,
     ) -> str:
         files_block = "\n".join(f"- {name}" for name in stats.files[:50])
         if not files_block:
             files_block = "- (none detected)"
 
+        scope_block = ""
+        if chunk_count > 1:
+            scope_block = (
+                "Chunk metadata:\n"
+                f"- Chunk: {chunk_index} of {chunk_count}\n"
+                f"- Full diff files changed: {full_stats.files_changed}\n"
+                f"- Full diff additions: {full_stats.additions}\n"
+                f"- Full diff deletions: {full_stats.deletions}\n"
+                f"- Full diff visible lines: {full_stats.line_count}\n"
+                f"- Chunk files changed: {stats.files_changed}\n"
+                f"- Chunk visible diff lines: {stats.line_count}\n\n"
+            )
+
         return (
             "Review this unified diff and return JSON using the required schema.\n\n"
             f"Review pass: {pass_name}\n"
             f"Focus: {focus}\n\n"
+            f"{scope_block}"
             "Diff metadata:\n"
             f"- Files changed: {stats.files_changed}\n"
             f"- Additions: {stats.additions}\n"
@@ -330,6 +426,7 @@ class PRReviewer:
             "- Only comment on visible code in the diff.\n"
             "- Keep findings actionable and concise.\n"
             "- Avoid duplicate findings; include only meaningful issues for this pass.\n"
+            "- If this is one chunk of a larger diff, do not speculate about code outside this chunk.\n"
             "- If uncertain, lower confidence instead of overstating.\n\n"
             "DIFF_START\n"
             f"{diff_text}\n"
@@ -489,10 +586,44 @@ def _sort_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
 def _build_multi_summary(
     payloads: list[tuple[str, LLMReviewPayload]],
     findings: list[ReviewFinding],
+    *,
+    chunk_count: int = 1,
+) -> str:
+    passes = ", ".join(_unique_pass_names(payloads))
+    if not findings:
+        if chunk_count > 1:
+            return (
+                f"Chunked multi-pass review across {chunk_count} diff chunks ({passes}) "
+                "found no material issues in the visible diff."
+            )
+        return f"Multi-pass review ({passes}) found no material issues in the visible diff."
+
+    high = sum(1 for finding in findings if finding.severity == Severity.high)
+    medium = sum(1 for finding in findings if finding.severity == Severity.medium)
+    low = sum(1 for finding in findings if finding.severity == Severity.low)
+
+    top_titles = "; ".join(finding.title for finding in _sort_findings(findings)[:3])
+    if chunk_count > 1:
+        return (
+            f"Chunked multi-pass review across {chunk_count} diff chunks ({passes}) surfaced "
+            f"{len(findings)} unique findings (high: {high}, medium: {medium}, low: {low}). "
+            f"Top risks: {top_titles}."
+        )
+    return (
+        f"Multi-pass review ({passes}) surfaced {len(findings)} unique findings "
+        f"(high: {high}, medium: {medium}, low: {low}). "
+        f"Top risks: {top_titles}."
+    )
+
+
+def _build_single_summary(
+    findings: list[ReviewFinding],
+    *,
+    chunk_count: int,
 ) -> str:
     if not findings:
         return (
-            "Multi-pass review (correctness, security, performance) found no material issues "
+            f"Chunked review across {chunk_count} diff chunks found no material issues "
             "in the visible diff."
         )
 
@@ -500,10 +631,9 @@ def _build_multi_summary(
     medium = sum(1 for finding in findings if finding.severity == Severity.medium)
     low = sum(1 for finding in findings if finding.severity == Severity.low)
 
-    top_titles = "; ".join(finding.title for finding in _sort_findings(findings)[:3])
-    passes = ", ".join(name for name, _ in payloads)
+    top_titles = "; ".join(finding.title for finding in findings[:3])
     return (
-        f"Multi-pass review ({passes}) surfaced {len(findings)} unique findings "
+        f"Chunked review across {chunk_count} diff chunks surfaced {len(findings)} unique findings "
         f"(high: {high}, medium: {medium}, low: {low}). "
         f"Top risks: {top_titles}."
     )
@@ -539,3 +669,48 @@ def _similarity(left: str, right: str) -> float:
     if not left or not right:
         return 0.0
     return SequenceMatcher(None, left, right).ratio()
+
+
+def _format_chunk_warning(
+    warning: str,
+    *,
+    pass_name: str,
+    chunk_index: int,
+    chunk_count: int,
+) -> str:
+    labels: list[str] = []
+    if pass_name != "general":
+        labels.append(pass_name)
+    if chunk_count > 1:
+        labels.append(f"chunk {chunk_index}/{chunk_count}")
+
+    if not labels:
+        return warning
+    return f"[{', '.join(labels)}] {warning}"
+
+
+def _tag_raw_response(
+    raw_response: str,
+    *,
+    pass_name: str,
+    chunk_index: int,
+    chunk_count: int,
+) -> str:
+    labels: list[str] = []
+    if pass_name != "general":
+        labels.append(pass_name)
+    if chunk_count > 1:
+        labels.append(f"chunk {chunk_index}/{chunk_count}")
+    if not labels:
+        return raw_response
+    return f"[{', '.join(labels)}]\n{raw_response}"
+
+
+def _unique_pass_names(payloads: list[tuple[str, LLMReviewPayload]]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for pass_name, _ in payloads:
+        if pass_name not in seen:
+            ordered.append(pass_name)
+            seen.add(pass_name)
+    return ordered

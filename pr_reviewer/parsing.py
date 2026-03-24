@@ -37,6 +37,12 @@ class ParsedDiff:
     changed_new_lines: dict[str, set[int]] = field(default_factory=dict)
 
 
+@dataclass
+class DiffChunk:
+    diff_text: str
+    stats: DiffStats
+
+
 def read_patch_file(path: str | Path) -> str:
     return Path(path).read_text(encoding="utf-8", errors="replace")
 
@@ -245,6 +251,40 @@ def build_finding_annotation(
     return target_hunk.header, "\n".join(frame_lines), on_changed_line
 
 
+def chunk_diff(diff_text: str, max_lines: int) -> tuple[list[DiffChunk], bool, int]:
+    lines = diff_text.splitlines()
+    original_line_count = len(lines)
+
+    if not lines:
+        return [DiffChunk(diff_text="", stats=parse_unified_diff("").stats)], False, 0
+
+    if max_lines <= 0:
+        return [DiffChunk(diff_text="", stats=parse_unified_diff("").stats)], True, original_line_count
+
+    if original_line_count <= max_lines:
+        return [DiffChunk(diff_text=diff_text, stats=parse_unified_diff(diff_text).stats)], False, original_line_count
+
+    patch_sections = _split_patch_sections(lines)
+    if patch_sections:
+        chunk_lines = _build_patch_chunks(patch_sections, max_lines)
+    else:
+        chunk_lines = _split_line_windows(lines, max_lines=max_lines, overlap=_window_overlap(max_lines))
+
+    chunks = [
+        DiffChunk(
+            diff_text="\n".join(chunk),
+            stats=parse_unified_diff("\n".join(chunk)).stats,
+        )
+        for chunk in chunk_lines
+        if chunk
+    ]
+    if not chunks:
+        fallback_text, _, _ = truncate_diff(diff_text, max_lines=max_lines)
+        return [DiffChunk(diff_text=fallback_text, stats=parse_unified_diff(fallback_text).stats)], True, original_line_count
+
+    return chunks, len(chunks) > 1, original_line_count
+
+
 def truncate_diff(diff_text: str, max_lines: int) -> tuple[str, bool, int]:
     lines = diff_text.splitlines()
     original_line_count = len(lines)
@@ -340,3 +380,132 @@ def _register_file(file_path: str, files: list[str], seen_files: set[str]) -> No
     if file_path and file_path not in seen_files:
         files.append(file_path)
         seen_files.add(file_path)
+
+
+def _split_patch_sections(lines: list[str]) -> list[list[str]]:
+    section_starts = [idx for idx, line in enumerate(lines) if _DIFF_HEADER_RE.match(line)]
+    if not section_starts:
+        return []
+
+    sections: list[list[str]] = []
+    for idx, start in enumerate(section_starts):
+        end = section_starts[idx + 1] if idx + 1 < len(section_starts) else len(lines)
+        section = lines[start:end]
+        if section:
+            sections.append(section)
+    return sections
+
+
+def _build_patch_chunks(sections: list[list[str]], max_lines: int) -> list[list[str]]:
+    chunks: list[list[str]] = []
+    current: list[str] = []
+
+    for section in sections:
+        if len(section) > max_lines:
+            if current:
+                chunks.append(current)
+                current = []
+            chunks.extend(_split_large_patch_section(section, max_lines))
+            continue
+
+        if current and len(current) + len(section) > max_lines:
+            chunks.append(current)
+            current = []
+
+        current.extend(section)
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _split_large_patch_section(section: list[str], max_lines: int) -> list[list[str]]:
+    hunk_starts = [idx for idx, line in enumerate(section) if _HUNK_HEADER_RE.match(line)]
+    if not hunk_starts:
+        return _split_line_windows(section, max_lines=max_lines, overlap=_window_overlap(max_lines))
+
+    preamble = section[: hunk_starts[0]]
+    if len(preamble) >= max_lines:
+        return _split_line_windows(section, max_lines=max_lines, overlap=_window_overlap(max_lines))
+
+    hunks: list[list[str]] = []
+    for idx, start in enumerate(hunk_starts):
+        end = hunk_starts[idx + 1] if idx + 1 < len(hunk_starts) else len(section)
+        hunks.append(section[start:end])
+
+    chunks: list[list[str]] = []
+    current = preamble.copy()
+    current_has_hunk = False
+
+    for hunk in hunks:
+        if current_has_hunk and len(current) + len(hunk) > max_lines:
+            chunks.append(current)
+            current = preamble.copy()
+            current_has_hunk = False
+
+        if len(preamble) + len(hunk) > max_lines:
+            if current_has_hunk:
+                chunks.append(current)
+                current = preamble.copy()
+                current_has_hunk = False
+            chunks.extend(_split_large_hunk(preamble, hunk, max_lines))
+            continue
+
+        current.extend(hunk)
+        current_has_hunk = True
+
+    if current_has_hunk:
+        chunks.append(current)
+
+    return chunks
+
+
+def _split_large_hunk(preamble: list[str], hunk: list[str], max_lines: int) -> list[list[str]]:
+    if not hunk:
+        return []
+
+    hunk_header = [hunk[0]]
+    hunk_body = hunk[1:]
+    available_body_lines = max_lines - len(preamble) - len(hunk_header)
+    if available_body_lines <= 0:
+        return _split_line_windows(preamble + hunk, max_lines=max_lines, overlap=_window_overlap(max_lines))
+
+    overlap = _window_overlap(available_body_lines)
+    body_windows = _split_line_windows(
+        hunk_body,
+        max_lines=available_body_lines,
+        overlap=overlap,
+    )
+    return [preamble + hunk_header + window for window in body_windows if window]
+
+
+def _split_line_windows(lines: list[str], *, max_lines: int, overlap: int) -> list[list[str]]:
+    if not lines:
+        return []
+    if max_lines <= 0:
+        return [[]]
+    if len(lines) <= max_lines:
+        return [lines]
+
+    effective_overlap = min(max(overlap, 0), max_lines - 1) if max_lines > 1 else 0
+    step = max(1, max_lines - effective_overlap)
+
+    windows: list[list[str]] = []
+    start = 0
+    while start < len(lines):
+        window = lines[start : start + max_lines]
+        if not window:
+            break
+        windows.append(window)
+        if len(window) < max_lines:
+            break
+        start += step
+
+    return windows
+
+
+def _window_overlap(max_lines: int) -> int:
+    if max_lines <= 8:
+        return 0
+    return min(12, max(2, max_lines // 6))
