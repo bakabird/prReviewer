@@ -7,7 +7,7 @@ import requests
 
 from . import __version__
 from .models import ReviewFinding, ReviewResult
-from .parsing import normalize_diff_path, parse_unified_diff
+from .parsing import normalize_diff_path, parse_unified_diff, resolve_diff_line
 
 
 class IntegrationError(RuntimeError):
@@ -21,6 +21,16 @@ class PostingReport:
     posted: int = 0
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CommentTarget:
+    file_path: str
+    old_path: str
+    new_path: str
+    old_line: int | None
+    new_line: int | None
+    line_type: str
 
 
 def post_findings(
@@ -110,16 +120,14 @@ def _post_to_github(
     if not head_sha:
         raise IntegrationError("Could not resolve GitHub PR head SHA.")
 
-    for finding in postable_findings:
+    for finding, target in postable_findings:
         report.attempted += 1
 
-        payload = {
-            "body": _build_comment_body(finding),
-            "path": normalize_diff_path(finding.file or ""),
-            "line": finding.line,
-            "side": "RIGHT",
-            "commit_id": head_sha,
-        }
+        payload = _build_github_comment_payload(
+            finding=finding,
+            target=target,
+            head_sha=head_sha,
+        )
         comment_url = f"{base_url.rstrip('/')}/repos/{repo}/pulls/{pr_number}/comments"
         response = session.post(comment_url, json=payload, timeout=30)
 
@@ -202,20 +210,16 @@ def _post_to_gitlab(
 
     discussions_url = f"{root}/projects/{project_ref}/merge_requests/{mr_iid}/discussions"
 
-    for finding in postable_findings:
+    for finding, target in postable_findings:
         report.attempted += 1
 
-        payload = {
-            "body": _build_comment_body(finding),
-            "position": {
-                "position_type": "text",
-                "base_sha": base_sha,
-                "start_sha": start_sha,
-                "head_sha": head_sha,
-                "new_path": normalize_diff_path(finding.file or ""),
-                "new_line": finding.line,
-            },
-        }
+        payload = _build_gitlab_comment_payload(
+            finding=finding,
+            target=target,
+            base_sha=base_sha,
+            start_sha=start_sha,
+            head_sha=head_sha,
+        )
         response = session.post(discussions_url, json=payload, timeout=30)
 
         if response.status_code in {200, 201}:
@@ -240,8 +244,8 @@ def _post_to_gitlab(
 def _collect_postable_findings(
     result: ReviewResult,
     parsed_diff,
-) -> tuple[list[ReviewFinding], int]:
-    postable: list[ReviewFinding] = []
+) -> tuple[list[tuple[ReviewFinding, CommentTarget]], int]:
+    postable: list[tuple[ReviewFinding, CommentTarget]] = []
     skipped = 0
 
     for finding in result.findings:
@@ -249,18 +253,98 @@ def _collect_postable_findings(
             skipped += 1
             continue
 
-        normalized = normalize_diff_path(finding.file)
-        on_changed_line = finding.on_changed_line
-        if on_changed_line is None:
-            on_changed_line = finding.line in parsed_diff.changed_new_lines.get(normalized, set())
-
-        if not on_changed_line:
+        target = _resolve_comment_target(finding, parsed_diff)
+        if target is None:
             skipped += 1
             continue
 
-        postable.append(finding)
+        postable.append((finding, target))
 
     return postable, skipped
+
+
+def _resolve_comment_target(
+    finding: ReviewFinding,
+    parsed_diff,
+) -> CommentTarget | None:
+    if not finding.file or not finding.line:
+        return None
+
+    resolved = resolve_diff_line(
+        parsed_diff,
+        file_path=finding.file,
+        line=finding.line,
+    )
+    if resolved is None:
+        return None
+
+    diff_file = resolved.diff_file
+    primary_path = diff_file.new_path or diff_file.old_path or diff_file.display_path
+    old_path = diff_file.old_path or primary_path
+    new_path = diff_file.new_path or primary_path
+    return CommentTarget(
+        file_path=primary_path,
+        old_path=old_path,
+        new_path=new_path,
+        old_line=resolved.hunk_line.old_line,
+        new_line=resolved.hunk_line.new_line,
+        line_type=resolved.hunk_line.line_type,
+    )
+
+
+def _build_github_comment_payload(
+    *,
+    finding: ReviewFinding,
+    target: CommentTarget,
+    head_sha: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "body": _build_comment_body(finding),
+        "path": normalize_diff_path(target.file_path),
+        "commit_id": head_sha,
+    }
+
+    if target.line_type == "del":
+        payload["line"] = target.old_line
+        payload["side"] = "LEFT"
+        return payload
+
+    payload["line"] = target.new_line or target.old_line
+    payload["side"] = "RIGHT"
+    return payload
+
+
+def _build_gitlab_comment_payload(
+    *,
+    finding: ReviewFinding,
+    target: CommentTarget,
+    base_sha: str,
+    start_sha: str,
+    head_sha: str,
+) -> dict[str, object]:
+    position: dict[str, object] = {
+        "position_type": "text",
+        "base_sha": base_sha,
+        "start_sha": start_sha,
+        "head_sha": head_sha,
+        "old_path": normalize_diff_path(target.old_path),
+        "new_path": normalize_diff_path(target.new_path),
+    }
+
+    if target.line_type == "del":
+        position["old_line"] = target.old_line
+    elif target.line_type == "add":
+        position["new_line"] = target.new_line
+    else:
+        if target.old_line is not None:
+            position["old_line"] = target.old_line
+        if target.new_line is not None:
+            position["new_line"] = target.new_line
+
+    return {
+        "body": _build_comment_body(finding),
+        "position": position,
+    }
 
 
 def _build_comment_body(finding: ReviewFinding) -> str:

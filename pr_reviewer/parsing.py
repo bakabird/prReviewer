@@ -35,6 +35,26 @@ class ParsedDiff:
     stats: DiffStats
     hunks_by_file: dict[str, list[DiffHunk]] = field(default_factory=dict)
     changed_new_lines: dict[str, set[int]] = field(default_factory=dict)
+    changed_old_lines: dict[str, set[int]] = field(default_factory=dict)
+    files_by_path: dict[str, "DiffFile"] = field(default_factory=dict)
+
+
+@dataclass
+class DiffFile:
+    old_path: str | None
+    new_path: str | None
+    display_path: str
+    hunks: list[DiffHunk] = field(default_factory=list)
+    changed_new_lines: set[int] = field(default_factory=set)
+    changed_old_lines: set[int] = field(default_factory=set)
+
+
+@dataclass
+class ResolvedDiffLine:
+    diff_file: DiffFile
+    hunk: DiffHunk
+    hunk_line: HunkLine
+    index: int
 
 
 @dataclass
@@ -69,33 +89,59 @@ def parse_unified_diff(diff_text: str) -> ParsedDiff:
 
     hunks_by_file: dict[str, list[DiffHunk]] = {}
     changed_new_lines: dict[str, set[int]] = {}
+    changed_old_lines: dict[str, set[int]] = {}
+    files_by_path: dict[str, DiffFile] = {}
 
     current_file: str | None = None
     current_hunk: DiffHunk | None = None
+    current_diff_file: DiffFile | None = None
     old_cursor = 0
     new_cursor = 0
+    pending_old_path: str | None = None
 
     for line in lines:
         diff_header = _DIFF_HEADER_RE.match(line)
         if diff_header:
             patch_like = True
-            current_file = normalize_diff_path(diff_header.group(2))
-            if current_file != "/dev/null":
-                _register_file(current_file, files, seen_files)
+            old_path = _normalize_optional_diff_path(diff_header.group(1))
+            new_path = _normalize_optional_diff_path(diff_header.group(2))
+            current_diff_file = _ensure_diff_file(
+                old_path=old_path,
+                new_path=new_path,
+                files=files,
+                seen_files=seen_files,
+                files_by_path=files_by_path,
+            )
+            current_file = current_diff_file.display_path
             current_hunk = None
+            pending_old_path = old_path
             continue
 
         if line.startswith("--- ") or line.startswith("+++ "):
             patch_like = True
-            if line.startswith("+++ "):
-                candidate = normalize_diff_path(line[4:])
-                if candidate and candidate != "/dev/null":
-                    current_file = candidate
-                    _register_file(candidate, files, seen_files)
+            if line.startswith("--- "):
+                pending_old_path = _normalize_optional_diff_path(line[4:])
+                continue
+
+            candidate = _normalize_optional_diff_path(line[4:])
+            if (
+                current_diff_file is None
+                or current_diff_file.old_path != pending_old_path
+                or current_diff_file.new_path != candidate
+            ):
+                current_diff_file = _ensure_diff_file(
+                    old_path=pending_old_path,
+                    new_path=candidate,
+                    files=files,
+                    seen_files=seen_files,
+                    files_by_path=files_by_path,
+                )
+                current_hunk = None
+            current_file = current_diff_file.display_path
             continue
 
         hunk_header = _HUNK_HEADER_RE.match(line)
-        if hunk_header and current_file:
+        if hunk_header and current_file and current_diff_file is not None:
             patch_like = True
             old_start = int(hunk_header.group(1))
             old_count = int(hunk_header.group(2) or 1)
@@ -113,7 +159,9 @@ def parse_unified_diff(diff_text: str) -> ParsedDiff:
                 new_count=new_count,
             )
             hunks_by_file.setdefault(current_file, []).append(current_hunk)
+            current_diff_file.hunks.append(current_hunk)
             changed_new_lines.setdefault(current_file, set())
+            changed_old_lines.setdefault(current_file, set())
             continue
 
         if line.startswith("+") and not line.startswith("+++"):
@@ -135,6 +183,7 @@ def parse_unified_diff(diff_text: str) -> ParsedDiff:
                 )
             )
             changed_new_lines[current_file].add(new_cursor)
+            current_diff_file.changed_new_lines.add(new_cursor)
             new_cursor += 1
             continue
 
@@ -148,6 +197,8 @@ def parse_unified_diff(diff_text: str) -> ParsedDiff:
                     content=line[1:],
                 )
             )
+            changed_old_lines[current_file].add(old_cursor)
+            current_diff_file.changed_old_lines.add(old_cursor)
             old_cursor += 1
             continue
 
@@ -183,7 +234,13 @@ def parse_unified_diff(diff_text: str) -> ParsedDiff:
         line_count=len(lines),
         patch_like=patch_like,
     )
-    return ParsedDiff(stats=stats, hunks_by_file=hunks_by_file, changed_new_lines=changed_new_lines)
+    return ParsedDiff(
+        stats=stats,
+        hunks_by_file=hunks_by_file,
+        changed_new_lines=changed_new_lines,
+        changed_old_lines=changed_old_lines,
+        files_by_path=files_by_path,
+    )
 
 
 def build_finding_annotation(
@@ -193,42 +250,19 @@ def build_finding_annotation(
     line: int,
     context: int = 2,
 ) -> tuple[str | None, str | None, bool]:
-    normalized = normalize_diff_path(file_path)
-    hunks = parsed_diff.hunks_by_file.get(normalized)
-    if not hunks:
+    resolved = resolve_diff_line(
+        parsed_diff,
+        file_path=file_path,
+        line=line,
+    )
+    if resolved is None:
         return None, None, False
 
-    target_hunk: DiffHunk | None = None
-    target_index: int | None = None
+    start = max(0, resolved.index - context)
+    end = min(len(resolved.hunk.lines), resolved.index + context + 1)
 
-    for hunk in hunks:
-        for idx, hunk_line in enumerate(hunk.lines):
-            if hunk_line.new_line == line:
-                target_hunk = hunk
-                target_index = idx
-                break
-        if target_hunk is not None:
-            break
-
-    # Fallback for findings that point to removed lines.
-    if target_hunk is None:
-        for hunk in hunks:
-            for idx, hunk_line in enumerate(hunk.lines):
-                if hunk_line.old_line == line:
-                    target_hunk = hunk
-                    target_index = idx
-                    break
-            if target_hunk is not None:
-                break
-
-    if target_hunk is None or target_index is None:
-        return None, None, False
-
-    start = max(0, target_index - context)
-    end = min(len(target_hunk.lines), target_index + context + 1)
-
-    frame_lines: list[str] = [target_hunk.header]
-    for hunk_line in target_hunk.lines[start:end]:
+    frame_lines: list[str] = [resolved.hunk.header]
+    for hunk_line in resolved.hunk.lines[start:end]:
         display_line = hunk_line.new_line if hunk_line.new_line is not None else hunk_line.old_line
         number = f"{display_line:>4}" if display_line is not None else "   -"
 
@@ -241,14 +275,46 @@ def build_finding_annotation(
         else:
             sign = "\\"
 
-        is_target = hunk_line.new_line == line or (
-            hunk_line.new_line is None and hunk_line.old_line == line
-        )
+        is_target = hunk_line is resolved.hunk_line
         marker = ">" if is_target else " "
         frame_lines.append(f"{marker}{number} {sign} {hunk_line.content}")
 
-    on_changed_line = line in parsed_diff.changed_new_lines.get(normalized, set())
-    return target_hunk.header, "\n".join(frame_lines), on_changed_line
+    on_changed_line = resolved.hunk_line.line_type in {"add", "del"}
+    return resolved.hunk.header, "\n".join(frame_lines), on_changed_line
+
+
+def resolve_diff_line(
+    parsed_diff: ParsedDiff,
+    *,
+    file_path: str,
+    line: int,
+) -> ResolvedDiffLine | None:
+    normalized = normalize_diff_path(file_path)
+    diff_file = parsed_diff.files_by_path.get(normalized)
+    if diff_file is None:
+        return None
+
+    for hunk in diff_file.hunks:
+        for idx, hunk_line in enumerate(hunk.lines):
+            if hunk_line.new_line == line:
+                return ResolvedDiffLine(
+                    diff_file=diff_file,
+                    hunk=hunk,
+                    hunk_line=hunk_line,
+                    index=idx,
+                )
+
+    for hunk in diff_file.hunks:
+        for idx, hunk_line in enumerate(hunk.lines):
+            if hunk_line.old_line == line:
+                return ResolvedDiffLine(
+                    diff_file=diff_file,
+                    hunk=hunk,
+                    hunk_line=hunk_line,
+                    index=idx,
+                )
+
+    return None
 
 
 def chunk_diff(diff_text: str, max_lines: int) -> tuple[list[DiffChunk], bool, int]:
@@ -380,6 +446,48 @@ def _register_file(file_path: str, files: list[str], seen_files: set[str]) -> No
     if file_path and file_path not in seen_files:
         files.append(file_path)
         seen_files.add(file_path)
+
+
+def _normalize_optional_diff_path(path: str) -> str | None:
+    normalized = normalize_diff_path(path)
+    if not normalized or normalized == "/dev/null":
+        return None
+    return normalized
+
+
+def _ensure_diff_file(
+    *,
+    old_path: str | None,
+    new_path: str | None,
+    files: list[str],
+    seen_files: set[str],
+    files_by_path: dict[str, DiffFile],
+) -> DiffFile:
+    aliases = [path for path in [new_path, old_path] if path]
+    for alias in aliases:
+        existing = files_by_path.get(alias)
+        if existing is not None:
+            if existing.old_path is None and old_path is not None:
+                existing.old_path = old_path
+            if existing.new_path is None and new_path is not None:
+                existing.new_path = new_path
+            _register_diff_file_aliases(existing, files_by_path)
+            return existing
+
+    display_path = new_path or old_path or "(unknown)"
+    diff_file = DiffFile(old_path=old_path, new_path=new_path, display_path=display_path)
+    _register_file(display_path, files, seen_files)
+    _register_diff_file_aliases(diff_file, files_by_path)
+    return diff_file
+
+
+def _register_diff_file_aliases(
+    diff_file: DiffFile,
+    files_by_path: dict[str, DiffFile],
+) -> None:
+    for alias in [diff_file.display_path, diff_file.old_path, diff_file.new_path]:
+        if alias:
+            files_by_path[alias] = diff_file
 
 
 def _split_patch_sections(lines: list[str]) -> list[list[str]]:
