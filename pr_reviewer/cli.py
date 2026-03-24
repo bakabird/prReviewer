@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from textwrap import dedent
 
@@ -13,8 +14,60 @@ from .llm import LLMError, OpenAICompatibleProvider, ProviderConfigError
 from .parsing import read_patch_file
 from .reviewer import PRReviewer
 
+_CONFIGURABLE_REVIEW_OPTIONS = {
+    "model",
+    "mode",
+    "max_lines",
+    "format",
+    "compact",
+    "base_url",
+    "color",
+    "post",
+    "repo",
+    "pr",
+    "mr",
+    "integration_token",
+    "integration_base_url",
+    "dry_run_post",
+}
+_CHOICE_VALIDATORS = {
+    "mode": {"single", "multi"},
+    "format": {"text", "json", "markdown"},
+    "color": {"auto", "always", "never"},
+    "post": {"github", "gitlab"},
+}
+_INT_VALIDATORS = {"max_lines", "pr", "mr"}
+_BOOL_VALIDATORS = {"compact", "dry_run_post"}
 
-def build_parser() -> argparse.ArgumentParser:
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def _default_review_options() -> dict[str, object]:
+    return {
+        "model": os.getenv("PR_REVIEWER_MODEL", "gpt-4.1-mini"),
+        "mode": "single",
+        "max_lines": 1200,
+        "format": "text",
+        "compact": False,
+        "base_url": os.getenv("PR_REVIEWER_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+        "color": "auto",
+        "post": None,
+        "repo": None,
+        "pr": None,
+        "mr": None,
+        "integration_token": None,
+        "integration_base_url": None,
+        "dry_run_post": False,
+    }
+
+
+def build_parser(*, review_defaults: dict[str, object] | None = None) -> argparse.ArgumentParser:
+    defaults = _default_review_options()
+    if review_defaults:
+        defaults.update(review_defaults)
+
     parser = argparse.ArgumentParser(
         prog="pr-reviewer",
         description=(
@@ -34,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to .pr-reviewer.toml or pyproject.toml to use for default review settings",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -71,25 +128,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_parser.add_argument(
         "--model",
-        default=os.getenv("PR_REVIEWER_MODEL", "gpt-4.1-mini"),
+        default=defaults["model"],
         help="LLM model identifier sent to the provider",
     )
     review_parser.add_argument(
         "--mode",
         choices=["single", "multi"],
-        default="single",
+        default=defaults["mode"],
         help="Review strategy: single-pass or multi-pass (correctness/security/performance)",
     )
     review_parser.add_argument(
         "--max-lines",
         type=int,
-        default=1200,
+        default=defaults["max_lines"],
         help="Approximate per-request diff line budget before the review splits into chunks",
     )
     review_parser.add_argument(
         "--format",
         choices=["text", "json", "markdown"],
-        default="text",
+        default=defaults["format"],
         help="Render format for review output",
     )
     review_parser.add_argument(
@@ -99,26 +156,29 @@ def build_parser() -> argparse.ArgumentParser:
     review_parser.add_argument(
         "--compact",
         action="store_true",
+        default=defaults["compact"],
         help="Compact list view (one line per finding)",
     )
     review_parser.add_argument(
         "--base-url",
-        default=os.getenv("PR_REVIEWER_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+        default=defaults["base_url"],
         help="OpenAI-compatible API base URL (default: OpenAI v1 endpoint)",
     )
     review_parser.add_argument(
         "--color",
         choices=["auto", "always", "never"],
-        default="auto",
+        default=defaults["color"],
         help="Color mode for text output",
     )
     review_parser.add_argument(
         "--post",
         choices=["github", "gitlab"],
+        default=defaults["post"],
         help="Post findings as inline review comments to a PR/MR",
     )
     review_parser.add_argument(
         "--repo",
+        default=defaults["repo"],
         help=(
             "Repository reference for posting: GitHub owner/name or GitLab project id/path"
         ),
@@ -126,24 +186,29 @@ def build_parser() -> argparse.ArgumentParser:
     review_parser.add_argument(
         "--pr",
         type=int,
+        default=defaults["pr"],
         help="GitHub pull request number (required with --post github)",
     )
     review_parser.add_argument(
         "--mr",
         type=int,
+        default=defaults["mr"],
         help="GitLab merge request IID (required with --post gitlab)",
     )
     review_parser.add_argument(
         "--integration-token",
+        default=defaults["integration_token"],
         help="Token override for posting (otherwise uses GITHUB_TOKEN or GITLAB_TOKEN)",
     )
     review_parser.add_argument(
         "--integration-base-url",
+        default=defaults["integration_base_url"],
         help="API base URL override for posting (GitHub Enterprise / self-hosted GitLab)",
     )
     review_parser.add_argument(
         "--dry-run-post",
         action="store_true",
+        default=defaults["dry_run_post"],
         help="Simulate posting without making network calls",
     )
 
@@ -151,7 +216,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+
+    try:
+        review_defaults = _load_review_config(_extract_config_arg(argv))
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    parser = build_parser(review_defaults=review_defaults)
     args = parser.parse_args(argv)
 
     if args.command == "review":
@@ -322,3 +396,106 @@ def _print_posting_report(*, report, dry_run: bool) -> None:
     )
     for error in report.errors[:8]:
         print(f"- {error}", file=sys.stderr)
+
+
+def _extract_config_arg(argv: list[str]) -> str | None:
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--config")
+    parsed, _ = bootstrap.parse_known_args(argv)
+    return parsed.config or os.getenv("PR_REVIEWER_CONFIG")
+
+
+def _load_review_config(explicit_path: str | None) -> dict[str, object]:
+    config_path = _resolve_config_path(explicit_path)
+    if config_path is None:
+        return {}
+
+    try:
+        with config_path.open("rb") as handle:
+            raw_data = tomllib.load(handle)
+    except OSError as exc:
+        raise ConfigError(f"could not read config file {config_path}: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"invalid TOML in {config_path}: {exc}") from exc
+
+    if config_path.name == "pyproject.toml":
+        tool_data = raw_data.get("tool")
+        if not isinstance(tool_data, dict):
+            return {}
+        config_data = tool_data.get("pr-reviewer")
+        if config_data is None:
+            return {}
+    else:
+        config_data = raw_data.get("review", raw_data)
+
+    if not isinstance(config_data, dict):
+        raise ConfigError(f"config section in {config_path} must be a TOML table")
+
+    return _validate_review_config(config_data, config_path)
+
+
+def _resolve_config_path(explicit_path: str | None) -> Path | None:
+    if explicit_path:
+        path = Path(explicit_path).expanduser()
+        if not path.is_file():
+            raise ConfigError(f"config file not found: {path}")
+        return path
+
+    for directory in [Path.cwd(), *Path.cwd().parents]:
+        dedicated = directory / ".pr-reviewer.toml"
+        if dedicated.is_file():
+            return dedicated
+
+        pyproject = directory / "pyproject.toml"
+        if pyproject.is_file() and _pyproject_has_review_config(pyproject):
+            return pyproject
+
+    return None
+
+
+def _pyproject_has_review_config(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+
+    tool = data.get("tool")
+    return isinstance(tool, dict) and isinstance(tool.get("pr-reviewer"), dict)
+
+
+def _validate_review_config(config_data: dict[str, object], config_path: Path) -> dict[str, object]:
+    normalized: dict[str, object] = {}
+    for raw_key, value in config_data.items():
+        key = raw_key.replace("-", "_")
+        if key not in _CONFIGURABLE_REVIEW_OPTIONS:
+            raise ConfigError(f"unsupported config key in {config_path}: {raw_key}")
+
+        if value is None:
+            normalized[key] = None
+            continue
+
+        if key in _BOOL_VALIDATORS:
+            if not isinstance(value, bool):
+                raise ConfigError(f"config key {raw_key} in {config_path} must be a boolean")
+            normalized[key] = value
+            continue
+
+        if key in _INT_VALIDATORS:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError(f"config key {raw_key} in {config_path} must be an integer")
+            normalized[key] = value
+            continue
+
+        if not isinstance(value, str):
+            raise ConfigError(f"config key {raw_key} in {config_path} must be a string")
+
+        if key in _CHOICE_VALIDATORS and value not in _CHOICE_VALIDATORS[key]:
+            allowed = ", ".join(sorted(_CHOICE_VALIDATORS[key]))
+            raise ConfigError(
+                f"config key {raw_key} in {config_path} must be one of: {allowed}"
+            )
+
+        normalized[key] = value
+
+    return normalized

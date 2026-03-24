@@ -45,6 +45,11 @@ class LLMReviewPayload(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
 
 
+class ChunkSynthesisPayload(BaseModel):
+    summary: str = Field(min_length=1, max_length=2000)
+    verdict: Verdict
+
+
 class DiffStats(BaseModel):
     files: list[str] = Field(default_factory=list)
     files_changed: int = 0

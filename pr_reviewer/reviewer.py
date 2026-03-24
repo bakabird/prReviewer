@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from .llm import LLMProvider
 from .models import (
     Category,
+    ChunkSynthesisPayload,
     DiffStats,
     LLMReviewPayload,
     ReviewFinding,
@@ -50,6 +51,21 @@ Confidence guidance:
 - 0.90-1.00: very likely issue based on explicit evidence in the diff
 - 0.70-0.89: likely issue with minor uncertainty
 - 0.40-0.69: plausible risk, less certain
+"""
+
+SYNTHESIS_SYSTEM_PROMPT = """You are an expert senior software engineer consolidating chunked PR review results.
+
+Rules:
+- Base every claim only on the provided chunk summaries and findings.
+- Do not invent new file paths, lines, or issues that are not already represented.
+- Focus on producing the strongest overall executive summary and verdict.
+- Return strict JSON only. No markdown, no code fences, no extra keys.
+
+JSON schema:
+{
+  "summary": "short executive summary",
+  "verdict": "looks good" | "needs attention" | "high risk"
+}
 """
 
 MULTI_PASS_FOCI: list[tuple[str, str]] = [
@@ -137,6 +153,7 @@ class PRReviewer:
         warnings: list[str],
     ) -> ReviewResult:
         payloads: list[LLMReviewPayload] = []
+        chunk_reviews: list[dict[str, object]] = []
         raw_failures: list[str] = []
         chunk_count = len(diff_chunks)
         focus = (
@@ -178,6 +195,13 @@ class PRReviewer:
                 continue
 
             payloads.append(payload)
+            chunk_reviews.append(
+                {
+                    "pass_name": "general",
+                    "chunk_index": chunk_index,
+                    "payload": payload,
+                }
+            )
 
         if not payloads:
             fallback_finding = ReviewFinding(
@@ -226,6 +250,18 @@ class PRReviewer:
         else:
             summary = _build_single_summary(sorted_findings, chunk_count=chunk_count)
             verdict = _infer_verdict(sorted_findings, [payload.verdict for payload in payloads])
+            if chunk_count > 1:
+                summary, verdict, synthesis_warning = self._synthesize_chunked_review(
+                    model=model,
+                    review_mode="single",
+                stats=stats,
+                findings=sorted_findings,
+                summary=summary,
+                verdict=verdict,
+                chunk_reviews=chunk_reviews,
+            )
+                if synthesis_warning:
+                    warnings.append(synthesis_warning)
 
         return ReviewResult(
             summary=summary,
@@ -248,6 +284,7 @@ class PRReviewer:
         warnings: list[str],
     ) -> ReviewResult:
         payloads: list[tuple[str, LLMReviewPayload]] = []
+        chunk_reviews: list[dict[str, object]] = []
         raw_failures: list[str] = []
         chunk_count = len(diff_chunks)
         successful_passes: list[str] = []
@@ -289,6 +326,13 @@ class PRReviewer:
                     continue
 
                 payloads.append((pass_name, payload))
+                chunk_reviews.append(
+                    {
+                        "pass_name": pass_name,
+                        "chunk_index": chunk_index,
+                        "payload": payload,
+                    }
+                )
                 pass_had_success = True
 
             if pass_had_success:
@@ -339,6 +383,18 @@ class PRReviewer:
         sorted_findings = _sort_findings(annotated_findings)
         verdict = _infer_verdict(sorted_findings, pass_verdicts)
         summary = _build_multi_summary(payloads, sorted_findings, chunk_count=chunk_count)
+        if chunk_count > 1:
+            summary, verdict, synthesis_warning = self._synthesize_chunked_review(
+                model=model,
+                review_mode="multi",
+                stats=stats,
+                findings=sorted_findings,
+                summary=summary,
+                verdict=verdict,
+                chunk_reviews=chunk_reviews,
+            )
+            if synthesis_warning:
+                warnings.append(synthesis_warning)
 
         return ReviewResult(
             summary=summary,
@@ -453,6 +509,38 @@ class PRReviewer:
 
         return findings
 
+    def _synthesize_chunked_review(
+        self,
+        *,
+        model: str,
+        review_mode: str,
+        stats: DiffStats,
+        findings: list[ReviewFinding],
+        summary: str,
+        verdict: Verdict,
+        chunk_reviews: list[dict[str, object]],
+    ) -> tuple[str, Verdict, str | None]:
+        user_prompt = _build_synthesis_prompt(
+            review_mode=review_mode,
+            stats=stats,
+            findings=findings,
+            summary=summary,
+            verdict=verdict,
+            chunk_reviews=chunk_reviews,
+        )
+
+        raw_response = self.provider.complete_json(
+            model=model,
+            system_prompt=SYNTHESIS_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+        )
+
+        payload, parse_warning = _parse_synthesis_payload(raw_response)
+        if payload is None:
+            return summary, verdict, f"[synthesis] {parse_warning}"
+
+        return payload.summary, payload.verdict, None
+
 
 def _parse_llm_payload(raw_text: str) -> tuple[LLMReviewPayload | None, str | None]:
     direct_warning: str | None = None
@@ -483,6 +571,33 @@ def _parse_llm_payload(raw_text: str) -> tuple[LLMReviewPayload | None, str | No
     return payload, direct_warning
 
 
+def _parse_synthesis_payload(raw_text: str) -> tuple[ChunkSynthesisPayload | None, str]:
+    text = raw_text.strip()
+    fenced_match = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL)
+    if fenced_match:
+        text = fenced_match.group(1).strip()
+
+    candidate_json = _extract_json_blob(text)
+    if candidate_json is None:
+        return None, "Chunk synthesis returned non-JSON output; using heuristic summary and verdict."
+
+    try:
+        parsed = json.loads(candidate_json)
+    except json.JSONDecodeError:
+        return None, "Chunk synthesis returned malformed JSON; using heuristic summary and verdict."
+
+    try:
+        payload = ChunkSynthesisPayload.model_validate(parsed)
+    except ValidationError as exc:
+        return (
+            None,
+            "Chunk synthesis JSON did not match the expected schema; using heuristic summary and verdict. "
+            f"Validation error: {exc.errors()[0].get('msg', 'unknown error')}.",
+        )
+
+    return payload, ""
+
+
 def _extract_json_blob(text: str) -> str | None:
     stripped = text.strip()
     if not stripped:
@@ -502,6 +617,73 @@ def _extract_json_blob(text: str) -> str | None:
         except json.JSONDecodeError:
             continue
     return None
+
+
+def _build_synthesis_prompt(
+    *,
+    review_mode: str,
+    stats: DiffStats,
+    findings: list[ReviewFinding],
+    summary: str,
+    verdict: Verdict,
+    chunk_reviews: list[dict[str, object]],
+) -> str:
+    files_block = "\n".join(f"- {name}" for name in stats.files[:50]) or "- (none detected)"
+
+    chunk_blocks: list[str] = []
+    for review in chunk_reviews:
+        payload = review["payload"]
+        if not isinstance(payload, LLMReviewPayload):
+            continue
+
+        pass_name = str(review["pass_name"])
+        chunk_index = int(review["chunk_index"])
+        titles = "; ".join(finding.title for finding in payload.findings[:3]) or "(none)"
+        chunk_blocks.append(
+            f"- Pass: {pass_name}\n"
+            f"  Chunk: {chunk_index}\n"
+            f"  Verdict: {payload.verdict.value}\n"
+            f"  Summary: {payload.summary}\n"
+            f"  Top finding titles: {titles}"
+        )
+
+    if not chunk_blocks:
+        chunk_blocks.append("- (none)")
+
+    finding_blocks: list[str] = []
+    for finding in findings[:25]:
+        location = ""
+        if finding.file and finding.line:
+            location = f" ({finding.file}:{finding.line})"
+        elif finding.file:
+            location = f" ({finding.file})"
+        finding_blocks.append(
+            f"- [{finding.severity.value.upper()}][{finding.category.value}] {finding.title}{location} "
+            f"(confidence: {finding.confidence:.2f})"
+        )
+
+    if not finding_blocks:
+        finding_blocks.append("- (none)")
+
+    return (
+        "Synthesize the final review outcome for a chunked diff review.\n\n"
+        f"Review mode: {review_mode}\n"
+        f"Files changed: {stats.files_changed}\n"
+        f"Additions: {stats.additions}\n"
+        f"Deletions: {stats.deletions}\n"
+        f"Visible diff lines: {stats.line_count}\n"
+        f"Original diff lines: {stats.original_line_count or stats.line_count}\n"
+        "Changed files:\n"
+        f"{files_block}\n\n"
+        "Current heuristic final result:\n"
+        f"- Verdict: {verdict.value}\n"
+        f"- Summary: {summary}\n\n"
+        "Chunk review outputs:\n"
+        f"{'\n'.join(chunk_blocks)}\n\n"
+        "Merged findings:\n"
+        f"{'\n'.join(finding_blocks)}\n\n"
+        "Return the best final summary and verdict only. Do not add new findings."
+    )
 
 
 def _dedupe_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:

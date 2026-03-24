@@ -157,16 +157,25 @@ def test_single_pass_review_splits_large_diffs_into_chunks() -> None:
                 ],
             }
         ),
+        json.dumps(
+            {
+                "summary": "Cross-chunk synthesis found two serious risks spanning correctness and secret handling.",
+                "verdict": "high risk",
+            }
+        ),
     ]
 
     provider = FakeProvider(responses)
     reviewer = PRReviewer(provider)
     result = reviewer.review(diff_text=BIG_DIFF, model="fake", review_mode="single", max_lines=11)
 
-    assert len(provider.prompts) == 2
+    assert len(provider.prompts) == 3
     assert "Chunk: 1 of 2" in provider.prompts[0]
     assert "Chunk: 2 of 2" in provider.prompts[1]
-    assert result.summary.startswith("Chunked review across 2 diff chunks surfaced 2 unique findings")
+    assert "Synthesize the final review outcome for a chunked diff review." in provider.prompts[2]
+    assert result.summary == (
+        "Cross-chunk synthesis found two serious risks spanning correctness and secret handling."
+    )
     assert result.verdict.value == "high risk"
     assert len(result.findings) == 2
     assert any("split the diff into 2 chunk(s)" in warning for warning in result.warnings)
@@ -246,16 +255,73 @@ def test_multi_pass_review_handles_chunked_diffs_and_dedupes_results() -> None:
                 "findings": [],
             }
         ),
+        json.dumps(
+            {
+                "summary": "Cross-chunk synthesis confirms the patch is high risk because it combines input masking with token leakage.",
+                "verdict": "high risk",
+            }
+        ),
     ]
 
     provider = FakeProvider(responses)
     reviewer = PRReviewer(provider)
     result = reviewer.review(diff_text=BIG_DIFF, model="fake", review_mode="multi", max_lines=11)
 
-    assert len(provider.prompts) == 6
+    assert len(provider.prompts) == 7
     assert result.passes_run == ["correctness", "security", "performance"]
-    assert result.summary.startswith("Chunked multi-pass review across 2 diff chunks")
+    assert "Synthesize the final review outcome for a chunked diff review." in provider.prompts[-1]
+    assert result.summary == (
+        "Cross-chunk synthesis confirms the patch is high risk because it combines input masking "
+        "with token leakage."
+    )
     assert len(result.findings) == 2
     assert any("Deduped 1 overlapping finding(s) across review passes and diff chunks." == warning for warning in result.warnings)
     duplicate_merged = next(f for f in result.findings if "reciprocal behavior" in f.title)
     assert duplicate_merged.confidence == 0.91
+
+
+def test_chunk_synthesis_falls_back_to_heuristics_when_response_is_invalid() -> None:
+    responses = [
+        json.dumps(
+            {
+                "summary": "Chunk one found a correctness issue.",
+                "verdict": "needs attention",
+                "findings": [
+                    {
+                        "severity": "high",
+                        "category": "bug",
+                        "title": "None case changes reciprocal behavior",
+                        "explanation": "Returning 0 for None hides invalid input.",
+                        "file": "app/a.py",
+                        "line": 3,
+                        "confidence": 0.88,
+                    }
+                ],
+            }
+        ),
+        json.dumps(
+            {
+                "summary": "Chunk two found a security issue.",
+                "verdict": "needs attention",
+                "findings": [
+                    {
+                        "severity": "high",
+                        "category": "security",
+                        "title": "Sensitive token is printed",
+                        "explanation": "Printing the token leaks secrets into logs.",
+                        "file": "app/b.py",
+                        "line": 12,
+                        "confidence": 0.94,
+                    }
+                ],
+            }
+        ),
+        "not json",
+    ]
+
+    reviewer = PRReviewer(FakeProvider(responses))
+    result = reviewer.review(diff_text=BIG_DIFF, model="fake", review_mode="single", max_lines=11)
+
+    assert result.summary.startswith("Chunked review across 2 diff chunks surfaced 2 unique findings")
+    assert result.verdict.value == "high risk"
+    assert any("[synthesis] Chunk synthesis returned non-JSON output" in warning for warning in result.warnings)

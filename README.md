@@ -19,6 +19,7 @@ Most AI code-review demos are either vague or overbuilt. `pr-reviewer` optimizes
 - Single-pass mode (`--mode single`) and multi-pass mode (`--mode multi`)
   - `multi` runs correctness, security, and performance passes, then dedupes and merges
 - Automatic chunked review for large diffs so broad PRs keep more context than a single truncated excerpt
+- Cross-chunk synthesis pass for large reviews so the final summary/verdict reflects the whole PR, not just isolated chunk outputs
 - Structured findings with:
   - severity: `low|medium|high`
   - category: `bug|security|performance|maintainability`
@@ -39,6 +40,8 @@ pip install -e '.[dev]'
 ```
 
 After installation, you can use either `pr-reviewer ...` or `python -m pr_reviewer ...`.
+
+`pr-reviewer` also supports repo-local defaults via `.pr-reviewer.toml` or `[tool.pr-reviewer]` in `pyproject.toml`.
 
 Required environment variable:
 
@@ -154,6 +157,41 @@ Save markdown output:
 python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --format markdown --save review.md
 ```
 
+## Config files
+
+Config is discovered from the current working directory upward in this order:
+
+1. `.pr-reviewer.toml`
+2. `pyproject.toml` with `[tool.pr-reviewer]`
+
+Explicit CLI flags override config values. Config values override environment/default values.
+
+Example `.pr-reviewer.toml`:
+
+```toml
+model = "gpt-4.1-mini"
+mode = "multi"
+max_lines = 900
+format = "markdown"
+color = "always"
+compact = false
+```
+
+Example `pyproject.toml`:
+
+```toml
+[tool.pr-reviewer]
+mode = "multi"
+max_lines = 900
+color = "always"
+```
+
+You can also point directly at a config file:
+
+```bash
+pr-reviewer --config /path/to/.pr-reviewer.toml review --cached
+```
+
 ## Posting findings to PR/MR
 
 Only findings mapped to changed lines are posted.
@@ -194,22 +232,22 @@ python -m pr_reviewer review --cached --post github --repo owner/repo --pr 123 -
 ## CLI synopsis
 
 ```text
-pr-reviewer review [patch] [--stdin] [--cached]
-                             [--mode single|multi]
-                             [--model MODEL]
-                             [--max-lines N]
-                             [--format text|json|markdown]
-                             [--save FILE]
-                             [--compact]
-                             [--base-url URL]
-                             [--color auto|always|never]
-                             [--post github|gitlab]
-                             [--repo REPO]
-                             [--pr N]
-                             [--mr N]
-                             [--integration-token TOKEN]
-                             [--integration-base-url URL]
-                             [--dry-run-post]
+pr-reviewer [--config FILE] review [patch] [--stdin] [--cached]
+                                    [--mode single|multi]
+                                    [--model MODEL]
+                                    [--max-lines N]
+                                    [--format text|json|markdown]
+                                    [--save FILE]
+                                    [--compact]
+                                    [--base-url URL]
+                                    [--color auto|always|never]
+                                    [--post github|gitlab]
+                                    [--repo REPO]
+                                    [--pr N]
+                                    [--mr N]
+                                    [--integration-token TOKEN]
+                                    [--integration-base-url URL]
+                                    [--dry-run-post]
 ```
 
 `--max-lines` is the approximate per-request chunk budget. Large diffs are automatically split across multiple review calls and merged back into one result.
