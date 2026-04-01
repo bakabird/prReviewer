@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import requests
 
 from . import __version__
-from .models import ReviewFinding, ReviewResult
 from .parsing import normalize_diff_path, parse_unified_diff, resolve_diff_line
+
+if TYPE_CHECKING:
+    from .models import ReviewFinding, ReviewResult
+
+logger = logging.getLogger(__name__)
+
+_CONNECT_TIMEOUT = 10
+_READ_TIMEOUT = 30
+_REQUEST_TIMEOUT = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
 
 
 class IntegrationError(RuntimeError):
@@ -95,6 +105,7 @@ def _post_to_github(
         for _ in postable_findings:
             report.attempted += 1
             report.posted += 1
+        logger.info("GitHub dry-run: %d comment(s) would be posted", report.posted)
         return report
 
     if not token:
@@ -111,7 +122,7 @@ def _post_to_github(
     )
 
     pr_url = f"{base_url.rstrip('/')}/repos/{repo}/pulls/{pr_number}"
-    pr_response = session.get(pr_url, timeout=30)
+    pr_response = session.get(pr_url, timeout=_REQUEST_TIMEOUT)
     if pr_response.status_code >= 400:
         raise IntegrationError(f"GitHub PR lookup failed ({pr_response.status_code}): {pr_response.text}")
 
@@ -129,7 +140,7 @@ def _post_to_github(
             head_sha=head_sha,
         )
         comment_url = f"{base_url.rstrip('/')}/repos/{repo}/pulls/{pr_number}/comments"
-        response = session.post(comment_url, json=payload, timeout=30)
+        response = session.post(comment_url, json=payload, timeout=_REQUEST_TIMEOUT)
 
         if response.status_code in {200, 201}:
             report.posted += 1
@@ -147,6 +158,7 @@ def _post_to_github(
             f"[{response.status_code}]."
         )
 
+    logger.info("GitHub posting complete: %d/%d posted, %d skipped", report.posted, report.attempted, report.skipped)
     return report
 
 
@@ -173,6 +185,7 @@ def _post_to_gitlab(
         for _ in postable_findings:
             report.attempted += 1
             report.posted += 1
+        logger.info("GitLab dry-run: %d comment(s) would be posted", report.posted)
         return report
 
     if not token:
@@ -191,7 +204,7 @@ def _post_to_gitlab(
     )
 
     versions_url = f"{root}/projects/{project_ref}/merge_requests/{mr_iid}/versions"
-    versions_response = session.get(versions_url, timeout=30)
+    versions_response = session.get(versions_url, timeout=_REQUEST_TIMEOUT)
     if versions_response.status_code >= 400:
         raise IntegrationError(
             f"GitLab MR versions lookup failed ({versions_response.status_code}): {versions_response.text}"
@@ -220,7 +233,7 @@ def _post_to_gitlab(
             start_sha=start_sha,
             head_sha=head_sha,
         )
-        response = session.post(discussions_url, json=payload, timeout=30)
+        response = session.post(discussions_url, json=payload, timeout=_REQUEST_TIMEOUT)
 
         if response.status_code in {200, 201}:
             report.posted += 1
@@ -238,6 +251,7 @@ def _post_to_gitlab(
             f"[{response.status_code}]."
         )
 
+    logger.info("GitLab posting complete: %d/%d posted, %d skipped", report.posted, report.attempted, report.skipped)
     return report
 
 

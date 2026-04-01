@@ -1,25 +1,25 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     low = "low"
     medium = "medium"
     high = "high"
 
 
-class Category(str, Enum):
+class Category(StrEnum):
     bug = "bug"
     security = "security"
     performance = "performance"
     maintainability = "maintainability"
 
 
-class Verdict(str, Enum):
+class Verdict(StrEnum):
     looks_good = "looks good"
     needs_attention = "needs attention"
     high_risk = "high risk"
@@ -68,4 +68,4 @@ class ReviewResult(LLMReviewPayload):
     passes_run: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     raw_response: str | None = None
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
