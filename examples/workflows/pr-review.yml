@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install pr-reviewer
-        run: pip install pr-reviewer
+        run: pip install git+https://github.com/NoahLundSyrdal/prReviewer.git
       - name: Get PR diff
         run: |
           git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/pr.patch

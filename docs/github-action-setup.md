@@ -4,7 +4,7 @@ Add automated LLM-powered PR reviews to your repository using the `pr-reviewer` 
 
 ## Quick Start
 
-1. Copy `.github/workflows/pr-review.yml` into your repository.
+1. Copy `examples/workflows/pr-review.yml` into your repo's `.github/workflows/` directory.
 2. Add the `PR_REVIEWER_API_KEY` secret to your repo (Settings > Secrets and variables > Actions).
 3. Open a pull request — the review will run automatically.
 
@@ -47,7 +47,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install pr-reviewer
-        run: pip install pr-reviewer
+        run: pip install git+https://github.com/NoahLundSyrdal/prReviewer.git
       - name: Get PR diff
         run: |
           git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/pr.patch
