@@ -8,6 +8,19 @@ version = "0.1.0"
 description = "LLM-powered CLI for structured PR review"
 readme = "README.md"
 requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Noah Lund Syrdal"}]
+keywords = ["code-review", "llm", "pull-request", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
   "pydantic>=2.6,<3",
   "requests>=2.31,<3",
@@ -16,10 +29,23 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0,<9",
+  "ruff>=0.4,<1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/NoahLundSyrdal/prReviewer"
+Repository = "https://github.com/NoahLundSyrdal/prReviewer"
 
 [project.scripts]
 pr-reviewer = "pr_reviewer.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pr_reviewer*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "TCH"]
+ignore = ["E501"]

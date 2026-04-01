@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from typing import Protocol
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderConfigError(RuntimeError):
@@ -25,7 +30,7 @@ class LLMProvider(Protocol):
 class OpenAICompatibleProvider:
     api_key: str | None = None
     base_url: str | None = None
-    timeout_seconds: int = 60
+    timeout_seconds: int = 120
     max_retries: int = 3
 
     def __post_init__(self) -> None:
@@ -62,7 +67,11 @@ class OpenAICompatibleProvider:
         response: requests.Response | None = None
         last_exception: requests.RequestException | None = None
         attempts = max(1, int(self.max_retries))
+        base_delay = 0.35
+        max_delay = 8.0
+
         for attempt in range(1, attempts + 1):
+            t0 = time.monotonic()
             try:
                 response = requests.post(
                     url,
@@ -71,9 +80,13 @@ class OpenAICompatibleProvider:
                     timeout=self.timeout_seconds,
                 )
             except requests.RequestException as exc:
+                elapsed = time.monotonic() - t0
+                logger.debug("LLM request failed after %.2fs: %s", elapsed, exc)
                 last_exception = exc
                 if attempt < attempts:
-                    time.sleep(min(4.0, 0.35 * (2 ** (attempt - 1))))
+                    delay = min(max_delay, base_delay * (2 ** (attempt - 1))) + random.uniform(0, 1)
+                    logger.warning("LLM request error (attempt %d/%d): %s — retrying in %.1fs", attempt, attempts, exc, delay)
+                    time.sleep(delay)
                     continue
 
                 raise LLMError(
@@ -82,8 +95,26 @@ class OpenAICompatibleProvider:
                     "Check network connectivity, DNS, VPN/proxy settings, and PR_REVIEWER_BASE_URL."
                 ) from exc
 
+            elapsed = time.monotonic() - t0
+            logger.debug("LLM response %d in %.2fs", response.status_code, elapsed)
+
             if response.status_code in {429, 500, 502, 503, 504} and attempt < attempts:
-                time.sleep(min(4.0, 0.35 * (2 ** (attempt - 1))))
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = min(max_delay, float(retry_after)) + random.uniform(0, 1)
+                    except ValueError:
+                        delay = min(max_delay, base_delay * (2 ** (attempt - 1))) + random.uniform(0, 1)
+                else:
+                    delay = min(max_delay, base_delay * (2 ** (attempt - 1))) + random.uniform(0, 1)
+                logger.warning(
+                    "LLM returned %d (attempt %d/%d) — retrying in %.1fs",
+                    response.status_code,
+                    attempt,
+                    attempts,
+                    delay,
+                )
+                time.sleep(delay)
                 continue
             break
 
@@ -95,10 +126,8 @@ class OpenAICompatibleProvider:
 
         if response.status_code >= 400:
             detail = response.text.strip()
-            try:
+            with contextlib.suppress(ValueError):
                 detail = response.json().get("error", {}).get("message", detail)
-            except ValueError:
-                pass
             raise LLMError(f"LLM provider error ({response.status_code}): {detail}")
 
         try:

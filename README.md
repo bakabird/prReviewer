@@ -1,6 +1,10 @@
 # pr-reviewer
 
-`pr-reviewer` is a product-grade CLI prototype for LLM-powered PR review.
+[![CI](https://github.com/NoahLundSyrdal/prReviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/NoahLundSyrdal/prReviewer/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+`pr-reviewer` is a product-grade CLI for LLM-powered PR review.
 
 It ingests a unified diff, runs structured analysis, and returns developer-first feedback with severity, category, confidence, and inline code-frame context. It can also post findings directly as inline comments on GitHub PRs or GitLab MRs.
 
@@ -30,6 +34,7 @@ Most AI code-review demos are either vague or overbuilt. `pr-reviewer` optimizes
   - GitHub PR review comments
   - GitLab MR discussions
 - Robust fallback when LLM returns malformed JSON
+- Structured logging with `--verbose` and `--debug` flags
 
 ## Quickstart
 
@@ -55,69 +60,6 @@ Optional model/provider settings:
 export PR_REVIEWER_BASE_URL="https://api.openai.com/v1"
 export PR_REVIEWER_MODEL="gpt-4.1-mini"
 ```
-
-## Demo TODO checklist (end-to-end)
-
-Use this as a copy-paste runbook for a live demo.
-
-- [ ] 1. Open repo and activate environment
-  ```bash
-  cd /Users/noahsyrdal/prReviewer
-  python -m venv .venv
-  source .venv/bin/activate
-  pip install -e '.[dev]'
-  ```
-
-- [ ] 2. Configure API access
-  ```bash
-  export PR_REVIEWER_API_KEY="your_api_key"
-  export PR_REVIEWER_BASE_URL="https://api.openai.com/v1"
-  ```
-
-- [ ] 3. Sanity check CLI
-  ```bash
-  pr-reviewer --help
-  pr-reviewer review --help
-  ```
-
-- [ ] 4. Run built-in real-project demo patch (`travelSync`)
-  ```bash
-  python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --format text --color always
-  ```
-
-- [ ] 5. Save shareable markdown output
-  ```bash
-  python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --format markdown --save /tmp/pr-review-demo.md
-  ```
-
-- [ ] 6. Run on your own current project changes (staged diff)
-  ```bash
-  cd /path/to/your/project
-  git add -p
-  git diff --cached > /tmp/my_project_demo.patch
-  cd /Users/noahsyrdal/prReviewer
-  python -m pr_reviewer review /tmp/my_project_demo.patch --mode multi --format text --color always
-  ```
-
-- [ ] 7. Optional: dry-run inline PR comments (safe integration demo)
-  ```bash
-  python -m pr_reviewer review /tmp/my_project_demo.patch \
-    --mode multi \
-    --post github \
-    --repo owner/repo \
-    --pr 123 \
-    --dry-run-post
-  ```
-
-- [ ] 8. Optional: post real inline comments
-  ```bash
-  export GITHUB_TOKEN="ghp_xxx"
-  python -m pr_reviewer review /tmp/my_project_demo.patch \
-    --mode multi \
-    --post github \
-    --repo owner/repo \
-    --pr 123
-  ```
 
 ## Core usage
 
@@ -155,6 +97,52 @@ Save markdown output:
 
 ```bash
 python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --format markdown --save review.md
+```
+
+Enable verbose logging:
+
+```bash
+python -m pr_reviewer --verbose review --cached
+python -m pr_reviewer --debug review --cached
+```
+
+## GitHub Action
+
+You can add automated PR review to your repository with a GitHub Actions workflow. See [docs/github-action-setup.md](docs/github-action-setup.md) for full instructions.
+
+Quick example — add this to `.github/workflows/pr-review.yml`:
+
+```yaml
+name: PR Review
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pr-reviewer
+      - run: git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/pr.patch
+      - name: Run review
+        env:
+          PR_REVIEWER_API_KEY: ${{ secrets.PR_REVIEWER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr-reviewer review /tmp/pr.patch \
+            --mode multi \
+            --post github \
+            --repo ${{ github.repository }} \
+            --pr ${{ github.event.pull_request.number }}
 ```
 
 ## Config files
@@ -224,7 +212,7 @@ Dry run posting:
 python -m pr_reviewer review --cached --post github --repo owner/repo --pr 123 --dry-run-post
 ```
 
-## Strong demo assets
+## Demo assets
 
 - Real project demo diff (travelSync): [`examples/travelsync_demo.patch`](./examples/travelsync_demo.patch)
 - Real project demo output (terminal): [`examples/travelsync_demo_output.txt`](./examples/travelsync_demo_output.txt)
@@ -232,22 +220,23 @@ python -m pr_reviewer review --cached --post github --repo owner/repo --pr 123 -
 ## CLI synopsis
 
 ```text
-pr-reviewer [--config FILE] review [patch] [--stdin] [--cached]
-                                    [--mode single|multi]
-                                    [--model MODEL]
-                                    [--max-lines N]
-                                    [--format text|json|markdown]
-                                    [--save FILE]
-                                    [--compact]
-                                    [--base-url URL]
-                                    [--color auto|always|never]
-                                    [--post github|gitlab]
-                                    [--repo REPO]
-                                    [--pr N]
-                                    [--mr N]
-                                    [--integration-token TOKEN]
-                                    [--integration-base-url URL]
-                                    [--dry-run-post]
+pr-reviewer [--config FILE] [-v | --verbose] [--debug]
+            review [patch] [--stdin] [--cached]
+                   [--mode single|multi]
+                   [--model MODEL]
+                   [--max-lines N]
+                   [--format text|json|markdown]
+                   [--save FILE]
+                   [--compact]
+                   [--base-url URL]
+                   [--color auto|always|never]
+                   [--post github|gitlab]
+                   [--repo REPO]
+                   [--pr N]
+                   [--mr N]
+                   [--integration-token TOKEN]
+                   [--integration-base-url URL]
+                   [--dry-run-post]
 ```
 
 `--max-lines` is the approximate per-request chunk budget. Large diffs are automatically split across multiple review calls and merged back into one result.
@@ -268,7 +257,7 @@ pr_reviewer/
 ## Testing
 
 ```bash
-pytest -q
+pytest -v
 ```
 
 ## Known limitations
@@ -277,7 +266,7 @@ pytest -q
 - Provider/model quality affects finding quality.
 - Some platform APIs may reject comments if diff position changed server-side.
 
-## Next iteration ideas
+## Roadmap
 
 - Repo-local config exists for CLI defaults (`.pr-reviewer.toml`); extend with explicit policy/rule text or pack files the prompts must follow.
 - Add GitHub Checks / GitLab pipeline summary mode.

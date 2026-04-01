@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -13,6 +14,8 @@ from .formatters import format_review
 from .llm import LLMError, OpenAICompatibleProvider, ProviderConfigError
 from .parsing import read_patch_file
 from .reviewer import PRReviewer
+
+logger = logging.getLogger(__name__)
 
 _CONFIGURABLE_REVIEW_OPTIONS = {
     "model",
@@ -38,6 +41,22 @@ _CHOICE_VALIDATORS = {
 }
 _INT_VALIDATORS = {"max_lines", "pr", "mr"}
 _BOOL_VALIDATORS = {"compact", "dry_run_post"}
+
+
+def _setup_logging(*, verbose: bool = False, debug: bool = False) -> None:
+    if debug:
+        level = logging.DEBUG
+    elif verbose:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    root = logging.getLogger("pr_reviewer")
+    root.setLevel(level)
+    root.addHandler(handler)
 
 
 class ConfigError(RuntimeError):
@@ -91,6 +110,19 @@ def build_parser(*, review_defaults: dict[str, object] | None = None) -> argpars
     parser.add_argument(
         "--config",
         help="Path to .pr-reviewer.toml or pyproject.toml to use for default review settings",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose (INFO level) logging on stderr",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug (DEBUG level) logging on stderr",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -228,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser(review_defaults=review_defaults)
     args = parser.parse_args(argv)
 
+    _setup_logging(verbose=getattr(args, "verbose", False), debug=getattr(args, "debug", False))
+
     if args.command == "review":
         return run_review(args)
 
@@ -238,17 +272,17 @@ def main(argv: list[str] | None = None) -> int:
 def run_review(args: argparse.Namespace) -> int:
     validation_error = _validate_post_args(args)
     if validation_error:
-        print(f"error: {validation_error}", file=sys.stderr)
+        logger.error("%s", validation_error)
         return 2
 
     try:
         diff_text = _resolve_diff_input(args)
     except (OSError, ValueError, RuntimeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logger.error("%s", exc)
         return 2
 
     if not diff_text.strip():
-        print("error: empty diff input", file=sys.stderr)
+        logger.error("empty diff input")
         return 2
 
     try:
@@ -261,7 +295,7 @@ def run_review(args: argparse.Namespace) -> int:
             review_mode=args.mode,
         )
     except (ProviderConfigError, LLMError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logger.error("%s", exc)
         return 1
 
     color = _use_color(args.color, args.format)
@@ -281,10 +315,10 @@ def run_review(args: argparse.Namespace) -> int:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(rendered + "\n", encoding="utf-8")
         except OSError as exc:
-            print(f"error: could not save output to {output_path}: {exc}", file=sys.stderr)
+            logger.error("could not save output to %s: %s", output_path, exc)
             return 1
 
-        print(f"Saved output to {output_path}", file=sys.stderr)
+        logger.info("Saved output to %s", output_path)
 
     if args.post:
         from .integrations import IntegrationError, post_findings
@@ -302,7 +336,7 @@ def run_review(args: argparse.Namespace) -> int:
                 dry_run=args.dry_run_post,
             )
         except IntegrationError as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            logger.error("%s", exc)
             return 1
 
         _print_posting_report(report=report, dry_run=args.dry_run_post)
@@ -318,6 +352,11 @@ def _resolve_diff_input(args: argparse.Namespace) -> str:
         raise ValueError("choose only one input source")
 
     if args.stdin:
+        if sys.stdin.isatty():
+            raise ValueError(
+                "stdin is a terminal — did you forget to pipe a diff? "
+                "Example: git diff | pr-reviewer review --stdin"
+            )
         return sys.stdin.read()
 
     if args.cached:
@@ -389,13 +428,16 @@ def _validate_post_args(args: argparse.Namespace) -> str | None:
 
 def _print_posting_report(*, report, dry_run: bool) -> None:
     mode = "dry-run posted" if dry_run else "posted"
-    print(
-        f"{report.platform} comments {mode}: {report.posted}/{report.attempted} "
-        f"(skipped: {report.skipped})",
-        file=sys.stderr,
+    logger.info(
+        "%s comments %s: %d/%d (skipped: %d)",
+        report.platform,
+        mode,
+        report.posted,
+        report.attempted,
+        report.skipped,
     )
     for error in report.errors[:8]:
-        print(f"- {error}", file=sys.stderr)
+        logger.warning("%s", error)
 
 
 def _extract_config_arg(argv: list[str]) -> str | None:

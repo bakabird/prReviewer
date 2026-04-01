@@ -1,11 +1,13 @@
+import pytest
+
 from pr_reviewer.parsing import (
     build_finding_annotation,
     chunk_diff,
     parse_diff_stats,
     parse_unified_diff,
+    read_patch_file,
     truncate_diff,
 )
-
 
 SAMPLE_DIFF = """diff --git a/api/user.py b/api/user.py
 index abc123..def456 100644
@@ -17,7 +19,7 @@ index abc123..def456 100644
 +    if user is None:
 +        return \"\"
 +    return user[\"name\"]
- 
+
 diff --git a/core/cache.py b/core/cache.py
 index 111111..222222 100644
 --- a/core/cache.py
@@ -27,6 +29,16 @@ index 111111..222222 100644
 -        cache[item.id] = expensive_lookup(item.id)
 +    cache.update({item.id: expensive_lookup(item.id) for item in items})
      return cache
+"""
+
+RENAME_DIFF = """diff --git a/app/old_name.py b/app/new_name.py
+index 1111111..2222222 100644
+--- a/app/old_name.py
++++ b/app/new_name.py
+@@ -1,2 +1,2 @@
+-def answer():
++def answer():
+     return 42
 """
 
 
@@ -121,3 +133,87 @@ def test_build_finding_annotation_maps_to_hunk_context() -> None:
     assert "@@" in code_frame
     assert 'return user["name"]' in code_frame
     assert on_changed_line is True
+
+
+def test_read_patch_file_large_file_warning(tmp_path, caplog) -> None:
+    """Files over 1MB should log a warning."""
+    import logging
+    large_file = tmp_path / "large.patch"
+    # Create a file just over 1MB
+    large_file.write_text("+" * 1_100_000, encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="pr_reviewer.parsing"):
+        content = read_patch_file(large_file)
+
+    assert len(content) == 1_100_000
+    assert any("large" in record.message.lower() for record in caplog.records)
+
+
+def test_read_patch_file_rejects_over_10mb(tmp_path) -> None:
+    """Files over 10MB should raise ValueError."""
+    huge_file = tmp_path / "huge.patch"
+    huge_file.write_text("+" * 10_100_000, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="too large"):
+        read_patch_file(huge_file)
+
+
+def test_rename_detection() -> None:
+    """Renamed files should have both old and new paths tracked."""
+    parsed = parse_unified_diff(RENAME_DIFF)
+
+    assert "app/new_name.py" in parsed.files_by_path
+    assert "app/old_name.py" in parsed.files_by_path
+
+    diff_file = parsed.files_by_path["app/new_name.py"]
+    assert diff_file.old_path == "app/old_name.py"
+    assert diff_file.new_path == "app/new_name.py"
+
+
+def test_overlapping_hunks_in_same_file() -> None:
+    """Multiple hunks in the same file should all be tracked."""
+    multi_hunk_diff = """diff --git a/app/multi.py b/app/multi.py
+index 1111111..2222222 100644
+--- a/app/multi.py
++++ b/app/multi.py
+@@ -1,3 +1,4 @@
+ def first():
++    audit()
+     return 1
+@@ -10,3 +11,4 @@
+ def second():
++    audit()
+     return 2
+"""
+    parsed = parse_unified_diff(multi_hunk_diff)
+
+    assert parsed.stats.files_changed == 1
+    assert parsed.stats.additions == 2
+    hunks = parsed.hunks_by_file["app/multi.py"]
+    assert len(hunks) == 2
+    assert hunks[0].new_start == 1
+    assert hunks[1].new_start == 11
+
+
+def test_chunk_diff_with_empty_input() -> None:
+    """Empty diff should return a single chunk and not be chunked."""
+    chunks, was_chunked, original_count = chunk_diff("", max_lines=100)
+
+    assert was_chunked is False
+    assert len(chunks) == 1
+    assert chunks[0].diff_text == ""
+
+
+def test_build_finding_annotation_unmapped_file() -> None:
+    """Annotation for a non-existent file should return None."""
+    parsed = parse_unified_diff(SAMPLE_DIFF)
+
+    hunk_header, code_frame, on_changed_line = build_finding_annotation(
+        parsed,
+        file_path="nonexistent.py",
+        line=1,
+    )
+
+    assert hunk_header is None
+    assert code_frame is None
+    assert on_changed_line is False

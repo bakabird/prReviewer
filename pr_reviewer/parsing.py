@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import DiffStats
+
+logger = logging.getLogger(__name__)
+
+_WARN_SIZE_BYTES = 1_000_000   # 1 MB
+_MAX_SIZE_BYTES = 10_000_000   # 10 MB
 
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -36,7 +42,7 @@ class ParsedDiff:
     hunks_by_file: dict[str, list[DiffHunk]] = field(default_factory=dict)
     changed_new_lines: dict[str, set[int]] = field(default_factory=dict)
     changed_old_lines: dict[str, set[int]] = field(default_factory=dict)
-    files_by_path: dict[str, "DiffFile"] = field(default_factory=dict)
+    files_by_path: dict[str, DiffFile] = field(default_factory=dict)
 
 
 @dataclass
@@ -64,7 +70,13 @@ class DiffChunk:
 
 
 def read_patch_file(path: str | Path) -> str:
-    return Path(path).read_text(encoding="utf-8", errors="replace")
+    p = Path(path)
+    size = p.stat().st_size
+    if size > _MAX_SIZE_BYTES:
+        raise ValueError(f"Diff file is too large ({size:,} bytes, max {_MAX_SIZE_BYTES:,}). Split the diff or increase the limit.")
+    if size > _WARN_SIZE_BYTES:
+        logger.warning("Diff file is large (%s bytes); review quality may be reduced.", f"{size:,}")
+    return p.read_text(encoding="utf-8", errors="replace")
 
 
 def normalize_diff_path(path: str) -> str:
@@ -429,7 +441,7 @@ def _truncate_diff_sections(
             break
 
     distributed_lines: list[str] = []
-    for section, take_count in zip(sections, take_counts):
+    for section, take_count in zip(sections, take_counts, strict=True):
         distributed_lines.extend(section[:take_count])
 
     if len(distributed_lines) >= original_line_count:

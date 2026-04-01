@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from datetime import timezone
+from datetime import UTC
+from typing import TYPE_CHECKING
 
-from .models import ReviewFinding, ReviewResult
+if TYPE_CHECKING:
+    from .models import ReviewFinding, ReviewResult
 
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
@@ -40,7 +42,7 @@ def format_review(
 def _format_text(result: ReviewResult, *, compact: bool, color: bool) -> str:
     severity_counts = _severity_counts(result.findings)
     verdict = _style(result.verdict.value.upper(), _VERDICT_COLOR[result.verdict.value], color)
-    generated_at = result.generated_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    generated_at = result.generated_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     lines: list[str] = [
         _style("PR Review", _BOLD, color),

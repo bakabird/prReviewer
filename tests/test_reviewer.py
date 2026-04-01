@@ -1,7 +1,7 @@
 import json
 
+from pr_reviewer.llm import LLMError
 from pr_reviewer.reviewer import PRReviewer
-
 
 SAMPLE_DIFF = """diff --git a/app/main.py b/app/main.py
 index 1111111..2222222 100644
@@ -52,6 +52,18 @@ class FakeProvider:
         response = self._responses[self._idx]
         self._idx += 1
         return response
+
+
+class FailingProvider:
+    """Provider that raises LLMError to test timeout/failure handling."""
+
+    def __init__(self, error_message: str = "Request timed out") -> None:
+        self._error_message = error_message
+        self.call_count = 0
+
+    def complete_json(self, *, model: str, system_prompt: str, user_prompt: str) -> str:
+        self.call_count += 1
+        raise LLMError(self._error_message)
 
 
 def test_multi_pass_review_dedupes_and_annotates_findings() -> None:
@@ -275,7 +287,7 @@ def test_multi_pass_review_handles_chunked_diffs_and_dedupes_results() -> None:
         "with token leakage."
     )
     assert len(result.findings) == 2
-    assert any("Deduped 1 overlapping finding(s) across review passes and diff chunks." == warning for warning in result.warnings)
+    assert any(warning == "Deduped 1 overlapping finding(s) across review passes and diff chunks." for warning in result.warnings)
     duplicate_merged = next(f for f in result.findings if "reciprocal behavior" in f.title)
     assert duplicate_merged.confidence == 0.91
 
@@ -325,3 +337,114 @@ def test_chunk_synthesis_falls_back_to_heuristics_when_response_is_invalid() -> 
     assert result.summary.startswith("Chunked review across 2 diff chunks surfaced 2 unique findings")
     assert result.verdict.value == "high risk"
     assert any("[synthesis] Chunk synthesis returned non-JSON output" in warning for warning in result.warnings)
+
+
+def test_single_pass_with_empty_diff() -> None:
+    """Review with empty diff should produce a result with no findings."""
+    responses = [
+        json.dumps({
+            "summary": "Nothing to review.",
+            "verdict": "looks good",
+            "findings": [],
+        })
+    ]
+
+    reviewer = PRReviewer(FakeProvider(responses))
+    result = reviewer.review(diff_text="", model="fake", review_mode="single")
+
+    assert result.verdict.value == "looks good"
+    assert len(result.findings) == 0
+
+
+def test_single_pass_multi_chunk_exercises_fixed_indentation_bug_path() -> None:
+    """Exercises the multi-chunk single-pass path that was broken by the indentation bug."""
+    responses = [
+        json.dumps({
+            "summary": "Chunk one looks good.",
+            "verdict": "looks good",
+            "findings": [],
+        }),
+        json.dumps({
+            "summary": "Chunk two has a note.",
+            "verdict": "needs attention",
+            "findings": [
+                {
+                    "severity": "low",
+                    "category": "maintainability",
+                    "title": "Consider adding a docstring",
+                    "explanation": "The function serialize lacks documentation.",
+                    "file": "app/b.py",
+                    "line": 10,
+                    "confidence": 0.60,
+                }
+            ],
+        }),
+        json.dumps({
+            "summary": "Overall the PR has minor documentation gaps.",
+            "verdict": "needs attention",
+        }),
+    ]
+
+    provider = FakeProvider(responses)
+    reviewer = PRReviewer(provider)
+    result = reviewer.review(diff_text=BIG_DIFF, model="fake", review_mode="single", max_lines=11)
+
+    # Verify the synthesis path was used (3 prompts: 2 chunks + 1 synthesis)
+    assert len(provider.prompts) == 3
+    assert result.verdict.value == "needs attention"
+    assert result.summary == "Overall the PR has minor documentation gaps."
+
+
+def test_llm_failure_surfaces_warning_instead_of_crash() -> None:
+    """When the LLM fails (e.g., timeout), _run_pass catches it and returns a warning."""
+    provider = FailingProvider("Request timed out")
+    reviewer = PRReviewer(provider)
+    result = reviewer.review(diff_text=SAMPLE_DIFF, model="fake", review_mode="single")
+
+    # Should not crash — fallback finding should be generated
+    assert result.verdict.value == "needs attention"
+    assert any("Could not parse model response" in f.title for f in result.findings)
+    assert provider.call_count == 1
+
+
+def test_multi_pass_partial_failure() -> None:
+    """If one pass fails but others succeed, results from successful passes are used."""
+
+    class MixedProvider:
+        def __init__(self):
+            self.call_count = 0
+
+        def complete_json(self, *, model, system_prompt, user_prompt):
+            self.call_count += 1
+            if self.call_count == 1:
+                # First pass succeeds
+                return json.dumps({
+                    "summary": "Correctness found an issue.",
+                    "verdict": "needs attention",
+                    "findings": [{
+                        "severity": "medium",
+                        "category": "bug",
+                        "title": "Possible null dereference",
+                        "explanation": "x could be None when x==0 returns 0.",
+                        "file": "app/main.py",
+                        "line": 2,
+                        "confidence": 0.80,
+                    }],
+                })
+            if self.call_count == 2:
+                # Second pass fails
+                raise LLMError("Rate limited")
+            # Third pass succeeds
+            return json.dumps({
+                "summary": "No performance issues.",
+                "verdict": "looks good",
+                "findings": [],
+            })
+
+    reviewer = PRReviewer(MixedProvider())
+    result = reviewer.review(diff_text=SAMPLE_DIFF, model="fake", review_mode="multi")
+
+    # Should still return results from successful passes
+    assert len(result.findings) >= 1
+    assert "correctness" in result.passes_run
+    assert "performance" in result.passes_run

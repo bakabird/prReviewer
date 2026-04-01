@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import logging
 from io import StringIO
 
 import pytest
 
-from pr_reviewer import __version__
-from pr_reviewer import cli
+from pr_reviewer import __version__, cli
 from pr_reviewer.models import DiffStats, ReviewResult, Verdict
-
 
 SAMPLE_DIFF = """diff --git a/app/main.py b/app/main.py
 index 1111111..2222222 100644
@@ -17,6 +16,16 @@ index 1111111..2222222 100644
 -print("old")
 +print("new")
 """
+
+
+@pytest.fixture(autouse=True)
+def _reset_logging():
+    """Reset pr_reviewer logger between tests so handlers don't accumulate."""
+    root = logging.getLogger("pr_reviewer")
+    root.handlers.clear()
+    root.setLevel(logging.WARNING)
+    yield
+    root.handlers.clear()
 
 
 def _sample_result() -> ReviewResult:
@@ -122,7 +131,7 @@ def test_main_reads_patch_and_saves_output(
 
     calls = _install_fake_review_flow(monkeypatch)
 
-    exit_code = cli.main(["review", str(patch_path), "--save", str(output_path)])
+    exit_code = cli.main(["--verbose", "review", str(patch_path), "--save", str(output_path)])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -295,3 +304,74 @@ def test_version_flag_prints_package_version(capsys: pytest.CaptureFixture[str])
     captured = capsys.readouterr()
     assert exc_info.value.code == 0
     assert __version__ in captured.out
+
+
+def test_verbose_flag_enables_info_logging(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    patch_path = tmp_path / "sample.patch"
+    patch_path.write_text(SAMPLE_DIFF, encoding="utf-8")
+    output_path = tmp_path / "review.txt"
+
+    _install_fake_review_flow(monkeypatch)
+
+    exit_code = cli.main(["--verbose", "review", str(patch_path), "--save", str(output_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # verbose enables INFO level, so "Saved output to" should appear
+    assert "Saved output to" in captured.err
+
+
+def test_tty_stdin_detection(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakeTTY:
+        def isatty(self):
+            return True
+
+        def read(self):
+            return ""
+
+    monkeypatch.setattr(cli.sys, "stdin", FakeTTY())
+
+    exit_code = cli.main(["review", "--stdin"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "stdin is a terminal" in captured.err
+
+
+def test_posting_workflow_with_mock(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    patch_path = tmp_path / "sample.patch"
+    patch_path.write_text(SAMPLE_DIFF, encoding="utf-8")
+
+    _install_fake_review_flow(monkeypatch)
+
+    # Mock post_findings to avoid needing a real integration
+    from pr_reviewer.integrations import PostingReport
+
+    def fake_post_findings(**kwargs):
+        return PostingReport(platform="github", attempted=1, posted=1, skipped=0)
+
+    monkeypatch.setattr("pr_reviewer.integrations.post_findings", fake_post_findings)
+
+    exit_code = cli.main([
+        "--verbose",
+        "review",
+        str(patch_path),
+        "--post", "github",
+        "--repo", "owner/repo",
+        "--pr", "1",
+        "--dry-run-post",
+    ])
+
+    capsys.readouterr()
+    assert exit_code == 0

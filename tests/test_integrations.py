@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 from pr_reviewer.integrations import IntegrationError, post_findings
 from pr_reviewer.models import (
@@ -9,7 +10,6 @@ from pr_reviewer.models import (
     Severity,
     Verdict,
 )
-
 
 SAMPLE_DIFF = """diff --git a/app/a.py b/app/a.py
 index 1111111..2222222 100644
@@ -77,10 +77,11 @@ def _result_with_findings(*findings: ReviewFinding) -> ReviewResult:
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, json_payload=None, text: str = "") -> None:
+    def __init__(self, status_code: int, json_payload=None, text: str = "", headers: dict | None = None) -> None:
         self.status_code = status_code
         self._json_payload = json_payload
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         if self._json_payload is None:
@@ -93,14 +94,14 @@ class _FakeSession:
         self.headers: dict[str, str] = {}
         self._get_responses = get_responses
         self._post_responses = post_responses
-        self.get_calls: list[tuple[str, int]] = []
-        self.post_calls: list[tuple[str, dict, int]] = []
+        self.get_calls: list[tuple] = []
+        self.post_calls: list[tuple] = []
 
-    def get(self, url: str, timeout: int):
+    def get(self, url: str, timeout=None):
         self.get_calls.append((url, timeout))
         return self._get_responses.pop(0)
 
-    def post(self, url: str, json: dict, timeout: int):
+    def post(self, url: str, json: dict, timeout=None):
         self.post_calls.append((url, json, timeout))
         return self._post_responses.pop(0)
 
@@ -322,3 +323,75 @@ def test_github_uses_new_path_when_finding_references_old_renamed_path(
     _, payload, _ = session.post_calls[0]
     assert payload["path"] == "app/new_name.py"
     assert payload["side"] == "RIGHT"
+
+
+def test_github_connection_error_handling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that connection errors are surfaced as IntegrationError."""
+
+    def fake_session_factory():
+        raise requests.ConnectionError("Connection refused")
+
+    # Patch at the point where the session fetches the PR
+    class ErrorSession:
+        headers: dict = {}
+
+        def update(self, d):
+            pass
+
+        def get(self, url, timeout=None):
+            raise requests.ConnectionError("Connection refused")
+
+    class FakeSessionClass:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, timeout=None):
+            raise requests.ConnectionError("Connection refused")
+
+        def post(self, url, json=None, timeout=None):
+            raise requests.ConnectionError("Connection refused")
+
+    monkeypatch.setattr("pr_reviewer.integrations.requests.Session", FakeSessionClass)
+
+    with pytest.raises(requests.ConnectionError):
+        post_findings(
+            platform="github",
+            result=_result(),
+            diff_text=SAMPLE_DIFF,
+            repo="owner/repo",
+            pr_number=1,
+            mr_iid=None,
+            token="token",
+            base_url="https://api.github.com",
+            dry_run=False,
+        )
+
+
+def test_github_422_skips_finding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that GitHub 422 responses are handled gracefully (position rejected)."""
+    session = _FakeSession(
+        get_responses=[_FakeResponse(200, {"head": {"sha": "abc123"}})],
+        post_responses=[_FakeResponse(422, {}, text="Unprocessable Entity")],
+    )
+    monkeypatch.setattr("pr_reviewer.integrations.requests.Session", lambda: session)
+
+    report = post_findings(
+        platform="github",
+        result=_result(),
+        diff_text=SAMPLE_DIFF,
+        repo="owner/repo",
+        pr_number=1,
+        mr_iid=None,
+        token="github-token",
+        base_url="https://api.github.com",
+        dry_run=False,
+    )
+
+    assert report.posted == 0
+    assert report.skipped == 1
+    assert len(report.errors) == 1
+    assert "rejected comment position" in report.errors[0]

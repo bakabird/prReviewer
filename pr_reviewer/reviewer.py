@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from difflib import SequenceMatcher
 
 from pydantic import ValidationError
 
-from .llm import LLMProvider
+from .llm import LLMError, LLMProvider
 from .models import (
     Category,
     ChunkSynthesisPayload,
@@ -18,6 +19,8 @@ from .models import (
     Verdict,
 )
 from .parsing import build_finding_annotation, chunk_diff, normalize_diff_path, parse_unified_diff
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are an expert senior software engineer performing PR review on a unified diff.
 
@@ -254,12 +257,12 @@ class PRReviewer:
                 summary, verdict, synthesis_warning = self._synthesize_chunked_review(
                     model=model,
                     review_mode="single",
-                stats=stats,
-                findings=sorted_findings,
-                summary=summary,
-                verdict=verdict,
-                chunk_reviews=chunk_reviews,
-            )
+                    stats=stats,
+                    findings=sorted_findings,
+                    summary=summary,
+                    verdict=verdict,
+                    chunk_reviews=chunk_reviews,
+                )
                 if synthesis_warning:
                     warnings.append(synthesis_warning)
 
@@ -419,6 +422,14 @@ class PRReviewer:
         chunk_index: int,
         chunk_count: int,
     ) -> tuple[LLMReviewPayload | None, str, str | None]:
+        logger.debug(
+            "Running pass=%s model=%s chunk=%d/%d lines=%d",
+            pass_name,
+            model,
+            chunk_index,
+            chunk_count,
+            stats.line_count,
+        )
         user_prompt = self._build_user_prompt(
             diff_text=diff_text,
             stats=stats,
@@ -429,11 +440,15 @@ class PRReviewer:
             chunk_count=chunk_count,
         )
 
-        raw_response = self.provider.complete_json(
-            model=model,
-            system_prompt=SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-        )
+        try:
+            raw_response = self.provider.complete_json(
+                model=model,
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+            )
+        except LLMError as exc:
+            logger.warning("LLM call failed for pass=%s chunk=%d/%d: %s", pass_name, chunk_index, chunk_count, exc)
+            return None, str(exc), f"LLM call failed: {exc}"
 
         payload, parse_warning = _parse_llm_payload(raw_response)
         return payload, raw_response, parse_warning
@@ -679,9 +694,9 @@ def _build_synthesis_prompt(
         f"- Verdict: {verdict.value}\n"
         f"- Summary: {summary}\n\n"
         "Chunk review outputs:\n"
-        f"{'\n'.join(chunk_blocks)}\n\n"
+        f"{chr(10).join(chunk_blocks)}\n\n"
         "Merged findings:\n"
-        f"{'\n'.join(finding_blocks)}\n\n"
+        f"{chr(10).join(finding_blocks)}\n\n"
         "Return the best final summary and verdict only. Do not add new findings."
     )
 
