@@ -36,23 +36,43 @@ Most AI code-review demos are either vague or overbuilt. `pr-reviewer` optimizes
 - Robust fallback when LLM returns malformed JSON
 - Structured logging with `--verbose` and `--debug` flags
 
-## Quickstart
+## Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
+pip install git+https://github.com/NoahLundSyrdal/prReviewer.git
 ```
+
+## Quickstart
+
+Set your API key:
+
+```bash
+export PR_REVIEWER_API_KEY="your-openai-api-key"
+```
+
+Review a diff:
+
+```bash
+git diff | pr-reviewer review --stdin
+```
+
+Review staged changes with multi-pass analysis:
+
+```bash
+pr-reviewer review --cached --mode multi
+```
+
+Review a patch file:
+
+```bash
+pr-reviewer review path/to/changes.patch --mode multi --format markdown --save review.md
+```
+
+## Core usage
 
 After installation, you can use either `pr-reviewer ...` or `python -m pr_reviewer ...`.
 
 `pr-reviewer` also supports repo-local defaults via `.pr-reviewer.toml` or `[tool.pr-reviewer]` in `pyproject.toml`.
-
-Required environment variable:
-
-```bash
-export PR_REVIEWER_API_KEY="your_api_key"
-```
 
 Optional model/provider settings:
 
@@ -61,49 +81,17 @@ export PR_REVIEWER_BASE_URL="https://api.openai.com/v1"
 export PR_REVIEWER_MODEL="gpt-4.1-mini"
 ```
 
-## Core usage
-
-Review a patch file:
-
-```bash
-python -m pr_reviewer review examples/travelsync_demo.patch --mode multi
-```
-
-Review current working diff:
-
-```bash
-git diff | python -m pr_reviewer review --stdin
-```
-
-Review staged changes:
-
-```bash
-python -m pr_reviewer review --cached
-```
-
-Run multi-pass review:
-
-```bash
-python -m pr_reviewer review examples/travelsync_demo.patch --mode multi
-```
-
 Compact terminal output:
 
 ```bash
-python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --compact --color always
-```
-
-Save markdown output:
-
-```bash
-python -m pr_reviewer review examples/travelsync_demo.patch --mode multi --format markdown --save review.md
+pr-reviewer review examples/travelsync_demo.patch --mode multi --compact --color always
 ```
 
 Enable verbose logging:
 
 ```bash
-python -m pr_reviewer --verbose review --cached
-python -m pr_reviewer --debug review --cached
+pr-reviewer --verbose review --cached
+pr-reviewer --debug review --cached
 ```
 
 ## GitHub Action
@@ -131,7 +119,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pr-reviewer
+      - run: pip install git+https://github.com/NoahLundSyrdal/prReviewer.git
       - run: git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/pr.patch
       - name: Run review
         env:
@@ -254,10 +242,26 @@ pr_reviewer/
   models.py       # typed schema
 ```
 
-## Testing
+## Development
+
+```bash
+git clone https://github.com/NoahLundSyrdal/prReviewer.git
+cd prReviewer
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+```
+
+Run tests:
 
 ```bash
 pytest -v
+```
+
+Lint:
+
+```bash
+ruff check .
 ```
 
 ## Known limitations

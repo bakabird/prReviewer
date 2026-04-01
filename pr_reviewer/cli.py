@@ -318,7 +318,7 @@ def run_review(args: argparse.Namespace) -> int:
             logger.error("could not save output to %s: %s", output_path, exc)
             return 1
 
-        logger.info("Saved output to %s", output_path)
+        print(f"Saved output to {output_path}", file=sys.stderr)
 
     if args.post:
         from .integrations import IntegrationError, post_findings
@@ -428,16 +428,13 @@ def _validate_post_args(args: argparse.Namespace) -> str | None:
 
 def _print_posting_report(*, report, dry_run: bool) -> None:
     mode = "dry-run posted" if dry_run else "posted"
-    logger.info(
-        "%s comments %s: %d/%d (skipped: %d)",
-        report.platform,
-        mode,
-        report.posted,
-        report.attempted,
-        report.skipped,
+    print(
+        f"{report.platform} comments {mode}: {report.posted}/{report.attempted} "
+        f"(skipped: {report.skipped})",
+        file=sys.stderr,
     )
     for error in report.errors[:8]:
-        logger.warning("%s", error)
+        print(f"  - {error}", file=sys.stderr)
 
 
 def _extract_config_arg(argv: list[str]) -> str | None:

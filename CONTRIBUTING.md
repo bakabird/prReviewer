@@ -12,6 +12,8 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 ```
 
+This is the canonical dev install method — all dependencies (including test and lint tools) are declared in `pyproject.toml`.
+
 ## Running Tests
 
 ```bash
