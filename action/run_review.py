@@ -102,13 +102,11 @@ def _fetch_pr_diff(repo: str, pr_number: str, token: str | None) -> str:
         "-H",
         "Accept: application/vnd.github.v3.diff",
         "-H",
-        f"Authorization: Bearer {token}" if token else "",
-        "-H",
         "X-GitHub-Api-Version: 2022-11-28",
-        url,
     ]
-    # Remove empty header if no token
-    cmd = [arg for arg in cmd if arg]
+    if token:
+        cmd.extend(["-H", f"Authorization: Bearer {token}"])
+    cmd.append(url)
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
