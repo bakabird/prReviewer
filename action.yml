@@ -1,4 +1,4 @@
-name: 'PR Reviewer'
+name: 'PR Copilot AI'
 description: 'LLM-powered PR review that posts structured, actionable inline comments on your pull requests'
 author: 'Noah Lund Syrdal'
 
