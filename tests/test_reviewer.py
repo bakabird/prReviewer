@@ -448,3 +448,27 @@ def test_multi_pass_partial_failure() -> None:
     assert len(result.findings) >= 1
     assert "correctness" in result.passes_run
     assert "performance" in result.passes_run
+
+
+def test_review_with_file_context_included_in_prompt(sample_diff: str) -> None:
+    """File context should appear in the user_prompt passed to the LLM."""
+    captured_prompts: list[str] = []
+
+    class CapturingProvider:
+        def complete_json(self, *, model: str, system_prompt: str, user_prompt: str, json_schema=None) -> str:
+            captured_prompts.append(user_prompt)
+            return '{"summary": "ok", "verdict": "looks good", "findings": []}'
+
+    reviewer = PRReviewer(CapturingProvider())
+    # sample_diff touches app/main.py — use that as the context key so it matches stats.files
+    file_context = {"app/main.py": "def foo():\n    return 42\n"}
+    reviewer.review(
+        diff_text=sample_diff,
+        model="gpt-4.1-mini",
+        file_context=file_context,
+    )
+
+    assert captured_prompts, "No LLM calls were made"
+    assert "app/main.py" in captured_prompts[0], "File context not injected into prompt"
+    assert "def foo():" in captured_prompts[0], "File content not in prompt"
+    assert "File context" in captured_prompts[0], "Context label not in prompt"
