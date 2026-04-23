@@ -27,9 +27,80 @@ jobs:
       - uses: NoahLundSyrdal/prReviewer@v1.1
         with:
           api_key: ${{ secrets.OPENAI_API_KEY }}
+          github_token: ${{ github.token }}
+          trigger: pull_request
+          mode: multi
+          max_lines: '1200'
+          exclude: '*.lock,dist/**,node_modules/**'
 ```
 
+`opened` runs the review when the PR is created. `synchronize` runs it again when new commits are pushed to the PR branch.
+
+`mode: multi` runs separate correctness, security, and performance passes before merging the findings. `max_lines: '1200'` is the approximate diff-line budget per LLM request; lower it to make smaller requests, or raise it to reduce chunking for large diffs.
+
 3. Open a pull request. That's it.
+
+## Trigger reviews from PR comments
+
+If you want AI review to run only when a maintainer asks for it, use an `issue_comment` workflow instead of the automatic `pull_request` trigger. Copy [examples/workflows/pr-review-command.yml](examples/workflows/pr-review-command.yml) to `.github/workflows/ai-pr-review.yml`.
+
+The workflow stays small because the action handles command parsing, PR lookup, commit range selection, patch fetching, and GitHub posting:
+
+```yaml
+name: AI PR Review Command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+env:
+  REVIEWER_BOT_NAME: reviewer001
+  REVIEWER_MODEL: your-model-name
+  REVIEWER_BASE_URL: https://your-openai-compatible-endpoint/v1
+
+jobs:
+  review:
+    if: ${{ github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: NoahLundSyrdal/prReviewer@main
+        with:
+          api_key: ${{ secrets.LLM_API_KEY }}
+          github_token: ${{ github.token }}
+          trigger: comment
+          reviewer_bot_name: ${{ env.REVIEWER_BOT_NAME }}
+          model: ${{ env.REVIEWER_MODEL }}
+          base_url: ${{ env.REVIEWER_BASE_URL }}
+          exclude: '*.lock,dist/**,node_modules/**'
+```
+
+The example responds only to PR comments from `OWNER`, `MEMBER`, or `COLLABORATOR` users, and only when the whole comment matches one of these commands:
+
+```text
+@reviewer001 full
+@reviewer001 last
+@reviewer001 last 2
+```
+
+- `@reviewer001 full` reviews the full PR diff from base to head.
+- `@reviewer001 last` reviews the latest commit.
+- `@reviewer001 last N` reviews the latest `N` commits as one combined diff. `N` must be an integer greater than or equal to 1.
+
+Change the reviewer command name in one place:
+
+```yaml
+env:
+  REVIEWER_BOT_NAME: reviewer001
+```
+
+The workflow uses the built-in `${{ github.token }}` for GitHub posting, so you do not need to create a separate GitHub token. Add your LLM key as a repository secret named `LLM_API_KEY` and pass it through the action's `api_key` input as shown above.
+
+The command-triggered workflow grants `issues: read` in addition to `contents: read` and `pull-requests: write`, because `issue_comment` events are delivered through GitHub's issues API.
 
 ### Required workflow permissions
 
@@ -84,6 +155,9 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
 | `max_lines` | No | `1200` | Max diff lines per review chunk |
 | `exclude` | No | — | Comma-separated glob patterns to skip |
 | `post_comments` | No | `true` | Whether to post inline PR comments |
+| `trigger` | No | `auto` | `auto`, `pull_request`, or `comment` |
+| `reviewer_bot_name` | No | `reviewer001` | Command name for comment-triggered reviews, without `@` |
+| `allowed_author_associations` | No | `OWNER,MEMBER,COLLABORATOR` | Comma-separated GitHub author associations allowed to trigger comment reviews |
 
 ## How it works
 

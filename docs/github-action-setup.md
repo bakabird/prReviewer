@@ -21,9 +21,59 @@ jobs:
       - uses: NoahLundSyrdal/prReviewer@v1.1
         with:
           api_key: ${{ secrets.OPENAI_API_KEY }}
+          github_token: ${{ github.token }}
+          trigger: pull_request
+          mode: multi
+          max_lines: '1200'
+          exclude: '*.lock,dist/**,node_modules/**'
 ```
 
+`opened` runs the review when the PR is created. `synchronize` runs it again when new commits are pushed to the PR branch.
+
+`mode: multi` runs separate correctness, security, and performance passes before merging the findings. `max_lines: '1200'` is the approximate diff-line budget per LLM request; lower it to make smaller requests, or raise it to reduce chunking for large diffs.
+
 4. Push and open a PR — the review will run automatically.
+
+## Triggering reviews from PR comments
+
+Use this workflow when you only want reviews after a maintainer comments with a command such as `@reviewer001 full`, `@reviewer001 last`, or `@reviewer001 last 2`:
+
+```yaml
+name: AI PR Review Command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+env:
+  REVIEWER_BOT_NAME: reviewer001
+  REVIEWER_MODEL: your-model-name
+  REVIEWER_BASE_URL: https://your-openai-compatible-endpoint/v1
+
+jobs:
+  review:
+    if: ${{ github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: NoahLundSyrdal/prReviewer@main
+        with:
+          api_key: ${{ secrets.LLM_API_KEY }}
+          github_token: ${{ github.token }}
+          trigger: comment
+          reviewer_bot_name: ${{ env.REVIEWER_BOT_NAME }}
+          model: ${{ env.REVIEWER_MODEL }}
+          base_url: ${{ env.REVIEWER_BASE_URL }}
+          mode: multi
+          max_lines: '1200'
+          exclude: '*.lock,dist/**,node_modules/**'
+```
+
+The action ignores ordinary issue comments, non-command PR comments, and comments from users outside `OWNER`, `MEMBER`, or `COLLABORATOR` by default. The built-in `${{ github.token }}` is enough for posting review comments; store only your LLM provider key in a secret such as `LLM_API_KEY`.
 
 ## Using a different LLM provider
 

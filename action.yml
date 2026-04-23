@@ -38,6 +38,18 @@ inputs:
     description: 'Whether to post inline comments on the PR'
     required: false
     default: 'true'
+  trigger:
+    description: 'Review trigger mode: auto, pull_request, or comment'
+    required: false
+    default: 'auto'
+  reviewer_bot_name:
+    description: 'Bot command name for comment-triggered reviews, without the leading @'
+    required: false
+    default: 'reviewer001'
+  allowed_author_associations:
+    description: 'Comma-separated GitHub author associations allowed to trigger comment reviews'
+    required: false
+    default: 'OWNER,MEMBER,COLLABORATOR'
 
 runs:
   using: 'composite'
@@ -63,6 +75,9 @@ runs:
         INPUT_MAX_LINES: ${{ inputs.max_lines }}
         INPUT_EXCLUDE: ${{ inputs.exclude }}
         INPUT_POST_COMMENTS: ${{ inputs.post_comments }}
+        INPUT_TRIGGER: ${{ inputs.trigger }}
+        INPUT_REVIEWER_BOT_NAME: ${{ inputs.reviewer_bot_name }}
+        INPUT_ALLOWED_AUTHOR_ASSOCIATIONS: ${{ inputs.allowed_author_associations }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
       run: python "${{ github.action_path }}/action/run_review.py"

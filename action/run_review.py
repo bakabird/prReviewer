@@ -5,15 +5,32 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ReviewCommand:
+    scope: str
+    count: int = 1
 
 
 def main() -> int:
-    pr_number = os.environ.get("PR_NUMBER")
+    event = _load_github_event(os.environ.get("GITHUB_EVENT_PATH"))
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    trigger = os.environ.get("INPUT_TRIGGER", "auto").strip().lower()
+    reviewer_bot_name = os.environ.get("INPUT_REVIEWER_BOT_NAME", "reviewer001")
+    allowed_author_associations = os.environ.get(
+        "INPUT_ALLOWED_AUTHOR_ASSOCIATIONS",
+        "OWNER,MEMBER,COLLABORATOR",
+    )
+
+    pr_number = _resolve_pull_request_number(event=event)
     repo = os.environ.get("REPO")
     token = os.environ.get("GITHUB_TOKEN")
     model = os.environ.get("INPUT_MODEL", "gpt-4.1-mini")
@@ -22,9 +39,18 @@ def main() -> int:
     exclude = os.environ.get("INPUT_EXCLUDE", "")
     post_comments = os.environ.get("INPUT_POST_COMMENTS", "true").lower() == "true"
 
-    if not pr_number:
-        print("Not a pull request. Skipping.")
+    review_request = _resolve_review_request(
+        trigger=trigger,
+        event_name=event_name,
+        event=event,
+        pr_number=pr_number,
+        reviewer_bot_name=reviewer_bot_name,
+        allowed_author_associations=allowed_author_associations,
+    )
+    if review_request is None:
         return 0
+
+    pr_number, command = review_request
 
     if not repo:
         print("::error::REPO is not set.", file=sys.stderr)
@@ -34,9 +60,8 @@ def main() -> int:
         print("::error::Missing api_key input. Set it to your OpenAI (or compatible) API key.", file=sys.stderr)
         return 1
 
-    # Fetch PR diff via GitHub API
     print(f"Fetching diff for PR #{pr_number} in {repo}...")
-    diff_text = _fetch_pr_diff(repo, pr_number, token)
+    diff_text = _fetch_review_diff(repo, pr_number, token, command)
     if not diff_text or not diff_text.strip():
         print("PR diff is empty — nothing to review.")
         return 0
@@ -96,15 +121,210 @@ def main() -> int:
     return result.returncode
 
 
+def _load_github_event(event_path: str | None) -> dict:
+    if not event_path:
+        return {}
+
+    try:
+        with open(event_path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"::warning::Could not read GitHub event payload: {exc}")
+        return {}
+
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_pull_request_number(*, event: dict) -> str | None:
+    env_pr_number = os.environ.get("PR_NUMBER")
+    if env_pr_number:
+        return env_pr_number
+
+    pull_request = event.get("pull_request")
+    if isinstance(pull_request, dict) and pull_request.get("number"):
+        return str(pull_request["number"])
+
+    issue = event.get("issue")
+    if isinstance(issue, dict) and issue.get("pull_request") and issue.get("number"):
+        return str(issue["number"])
+
+    return None
+
+
+def _resolve_review_request(
+    *,
+    trigger: str,
+    event_name: str,
+    event: dict,
+    pr_number: str | None,
+    reviewer_bot_name: str,
+    allowed_author_associations: str,
+) -> tuple[str, ReviewCommand] | None:
+    if trigger not in {"auto", "pull_request", "comment"}:
+        print(f"::error::Unsupported trigger input: {trigger}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if event_name == "issue_comment" or trigger == "comment":
+        if trigger == "pull_request":
+            print("Not a pull_request review trigger. Skipping.")
+            return None
+        return _resolve_comment_review_request(
+            event=event,
+            pr_number=pr_number,
+            reviewer_bot_name=reviewer_bot_name,
+            allowed_author_associations=allowed_author_associations,
+        )
+
+    if trigger == "comment":
+        print("Not an issue_comment event. Skipping.")
+        return None
+
+    if not pr_number:
+        print("Not a pull request. Skipping.")
+        return None
+
+    return pr_number, ReviewCommand(scope="full", count=0)
+
+
+def _resolve_comment_review_request(
+    *,
+    event: dict,
+    pr_number: str | None,
+    reviewer_bot_name: str,
+    allowed_author_associations: str,
+) -> tuple[str, ReviewCommand] | None:
+    issue = event.get("issue")
+    if not isinstance(issue, dict) or not issue.get("pull_request"):
+        print("Not a PR comment. Skipping.")
+        return None
+
+    if not pr_number:
+        print("Could not resolve PR number from issue_comment event. Skipping.")
+        return None
+
+    comment = event.get("comment")
+    if not isinstance(comment, dict):
+        print("No issue comment payload found. Skipping.")
+        return None
+
+    author_association = str(comment.get("author_association") or "").upper()
+    if not _is_authorized_author_association(author_association, allowed_author_associations):
+        print(f"Ignoring comment from unauthorized association: {author_association or 'UNKNOWN'}")
+        return None
+
+    command = _parse_review_command(str(comment.get("body") or ""), reviewer_bot_name)
+    if command is None:
+        print("Ignoring non-review command.")
+        return None
+
+    return pr_number, command
+
+
+def _parse_review_command(body: str, reviewer_bot_name: str) -> ReviewCommand | None:
+    command_text = body.replace("\r", "").strip()
+    escaped_bot_name = re.escape(reviewer_bot_name)
+
+    full_match = re.fullmatch(rf"@{escaped_bot_name}[ \t]+full", command_text)
+    if full_match:
+        return ReviewCommand(scope="full", count=0)
+
+    last_match = re.fullmatch(rf"@{escaped_bot_name}[ \t]+last(?:[ \t]+([1-9][0-9]*))?", command_text)
+    if last_match:
+        count = int(last_match.group(1) or "1")
+        return ReviewCommand(scope="last", count=count)
+
+    return None
+
+
+def _is_authorized_author_association(author_association: str, allowed_author_associations: str) -> bool:
+    allowed = {
+        association.strip().upper()
+        for association in allowed_author_associations.split(",")
+        if association.strip()
+    }
+    return author_association.upper() in allowed
+
+
+def _fetch_review_diff(repo: str, pr_number: str, token: str | None, command: ReviewCommand) -> str:
+    if command.scope == "full":
+        return _fetch_pr_diff(repo, pr_number, token)
+
+    commits = _fetch_pr_commits(repo, pr_number, token)
+    if not commits:
+        return ""
+
+    count = min(command.count, len(commits))
+    first_target_commit = commits[len(commits) - count]
+    start_sha = _first_parent_sha(first_target_commit)
+    pr_payload = _fetch_pr_metadata(repo, pr_number, token)
+    if not start_sha:
+        start_sha = str(pr_payload.get("base", {}).get("sha") or "")
+
+    head_sha = str(pr_payload.get("head", {}).get("sha") or _commit_sha(commits[-1]) or "")
+    compare_repo = _head_repo_full_name(pr_payload) or repo
+    if not start_sha or not head_sha:
+        print("::error::Could not resolve commit range for comment-triggered review.", file=sys.stderr)
+        raise SystemExit(1)
+
+    print(f"Reviewing latest {count} commit(s): {start_sha}...{head_sha}")
+    return _fetch_compare_diff(compare_repo, start_sha, head_sha, token)
+
+
 def _fetch_pr_diff(repo: str, pr_number: str, token: str | None) -> str:
     """Fetch the PR diff using curl (avoids adding requests as a dependency for the action)."""
     url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+    return _fetch_github_diff(url, token)
+
+
+def _fetch_compare_diff(repo: str, start_sha: str, head_sha: str, token: str | None) -> str:
+    url = f"https://api.github.com/repos/{repo}/compare/{start_sha}...{head_sha}"
+    return _fetch_github_diff(url, token)
+
+
+def _fetch_pr_metadata(repo: str, pr_number: str, token: str | None) -> dict:
+    payload = _fetch_github_json(f"https://api.github.com/repos/{repo}/pulls/{pr_number}", token)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _fetch_pr_commits(repo: str, pr_number: str, token: str | None) -> list[dict]:
+    commits: list[dict] = []
+    page = 1
+
+    while True:
+        url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/commits?per_page=100&page={page}"
+        payload = _fetch_github_json(url, token)
+        if not isinstance(payload, list):
+            print("::error::Unexpected GitHub commits API response.", file=sys.stderr)
+            raise SystemExit(1)
+
+        commits.extend(commit for commit in payload if isinstance(commit, dict))
+        if len(payload) < 100:
+            break
+        page += 1
+
+    return commits
+
+
+def _fetch_github_json(url: str, token: str | None):
+    response = _curl_github(url, token, accept="application/vnd.github+json")
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError as exc:
+        print(f"::error::Failed to parse GitHub API response: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
+def _fetch_github_diff(url: str, token: str | None) -> str:
+    return _curl_github(url, token, accept="application/vnd.github.v3.diff")
+
+
+def _curl_github(url: str, token: str | None, *, accept: str) -> str:
     cmd = [
         "curl",
         "-sS",
         "-f",
         "-H",
-        "Accept: application/vnd.github.v3.diff",
+        f"Accept: {accept}",
         "-H",
         "X-GitHub-Api-Version: 2022-11-28",
     ]
@@ -114,9 +334,40 @@ def _fetch_pr_diff(repo: str, pr_number: str, token: str | None) -> str:
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        print(f"::error::Failed to fetch PR diff: {proc.stderr.strip()}", file=sys.stderr)
+        print(f"::error::GitHub API request failed: {proc.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
     return proc.stdout
+
+
+def _first_parent_sha(commit: dict) -> str | None:
+    parents = commit.get("parents")
+    if not isinstance(parents, list) or not parents:
+        return None
+
+    first_parent = parents[0]
+    if not isinstance(first_parent, dict):
+        return None
+
+    sha = first_parent.get("sha")
+    return str(sha) if sha else None
+
+
+def _commit_sha(commit: dict) -> str | None:
+    sha = commit.get("sha")
+    return str(sha) if sha else None
+
+
+def _head_repo_full_name(pr_payload: dict) -> str | None:
+    head = pr_payload.get("head")
+    if not isinstance(head, dict):
+        return None
+
+    head_repo = head.get("repo")
+    if not isinstance(head_repo, dict):
+        return None
+
+    full_name = head_repo.get("full_name")
+    return str(full_name) if full_name else None
 
 
 def _filter_diff(diff_text: str, exclude_patterns: list[str]) -> str:

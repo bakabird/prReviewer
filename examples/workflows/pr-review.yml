@@ -15,3 +15,8 @@ jobs:
       - uses: NoahLundSyrdal/prReviewer@v1.1
         with:
           api_key: ${{ secrets.OPENAI_API_KEY }}
+          github_token: ${{ github.token }}
+          trigger: pull_request
+          mode: multi
+          max_lines: '1200'
+          exclude: '*.lock,dist/**,node_modules/**'
