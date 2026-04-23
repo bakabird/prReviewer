@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: NoahLundSyrdal/prReviewer@main
+      - uses: bakabird/prReviewer@main
         with:
           api_key: ${{ secrets.LLM_API_KEY }}
           github_token: ${{ github.token }}
