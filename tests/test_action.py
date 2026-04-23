@@ -167,6 +167,23 @@ def test_comment_review_request_returns_command_for_pr_comment():
     assert result == ("12", ReviewCommand(scope="last", count=2))
 
 
+def test_comment_trigger_skips_non_issue_comment_event(capsys):
+    event = {"pull_request": {"number": 12}}
+
+    result = _resolve_review_request(
+        trigger="comment",
+        event_name="pull_request",
+        event=event,
+        pr_number="12",
+        reviewer_bot_name="reviewer001",
+        allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
+    )
+
+    captured = capsys.readouterr()
+    assert result is None
+    assert "Not an issue_comment event" in captured.out
+
+
 def test_main_skips_non_command_comment_before_requiring_secrets(tmp_path, monkeypatch, capsys):
     event_path = tmp_path / "event.json"
     event_path.write_text(
@@ -246,6 +263,37 @@ def test_fetch_review_diff_for_fork_pr_compares_against_head_repo(monkeypatch):
 
     assert diff.startswith("diff --git")
     assert calls["compare"] == ("fork/repo", "c1", "fork-head", "token")
+
+
+def test_fetch_review_diff_for_fork_pr_base_fallback_compares_against_base_repo(monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(
+        run_review,
+        "_fetch_pr_commits",
+        lambda repo, pr_number, token: [
+            {"sha": "root", "parents": []},
+        ],
+    )
+    monkeypatch.setattr(
+        run_review,
+        "_fetch_pr_metadata",
+        lambda repo, pr_number, token: {
+            "base": {"sha": "base-only"},
+            "head": {"sha": "fork-head", "repo": {"full_name": "fork/repo"}},
+        },
+    )
+
+    def fake_fetch_compare_diff(repo, start_sha, head_sha, token):
+        calls["compare"] = (repo, start_sha, head_sha, token)
+        return "diff --git a/app.py b/app.py\n"
+
+    monkeypatch.setattr(run_review, "_fetch_compare_diff", fake_fetch_compare_diff)
+
+    diff = _fetch_review_diff("owner/repo", "12", "token", ReviewCommand(scope="last", count=1))
+
+    assert diff.startswith("diff --git")
+    assert calls["compare"] == ("owner/repo", "base-only", "fork-head", "token")
 
 
 def test_fetch_review_diff_for_full_uses_pr_diff(monkeypatch):

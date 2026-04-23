@@ -164,7 +164,7 @@ def _resolve_review_request(
         print(f"::error::Unsupported trigger input: {trigger}", file=sys.stderr)
         raise SystemExit(1)
 
-    if event_name == "issue_comment" or trigger == "comment":
+    if event_name == "issue_comment":
         if trigger == "pull_request":
             print("Not a pull_request review trigger. Skipping.")
             return None
@@ -256,12 +256,14 @@ def _fetch_review_diff(repo: str, pr_number: str, token: str | None, command: Re
     count = min(command.count, len(commits))
     first_target_commit = commits[len(commits) - count]
     start_sha = _first_parent_sha(first_target_commit)
+    start_sha_from_pr_commit_parent = bool(start_sha)
     pr_payload = _fetch_pr_metadata(repo, pr_number, token)
     if not start_sha:
         start_sha = str(pr_payload.get("base", {}).get("sha") or "")
 
     head_sha = str(pr_payload.get("head", {}).get("sha") or _commit_sha(commits[-1]) or "")
-    compare_repo = _head_repo_full_name(pr_payload) or repo
+    compare_repo = _head_repo_full_name(pr_payload) if start_sha_from_pr_commit_parent else None
+    compare_repo = compare_repo or repo
     if not start_sha or not head_sha:
         print("::error::Could not resolve commit range for comment-triggered review.", file=sys.stderr)
         raise SystemExit(1)
