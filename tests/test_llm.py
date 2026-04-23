@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from pr_reviewer.llm import OpenAICompatibleProvider
@@ -54,6 +56,7 @@ def test_json_schema_mode_included_in_payload() -> None:
     assert sent_payload["response_format"]["json_schema"]["name"] == "review_result"
     assert sent_payload["response_format"]["json_schema"]["strict"] is True
     assert sent_payload["response_format"]["json_schema"]["schema"] == SIMPLE_SCHEMA
+    assert sent_payload["stream"] is False
 
 
 def test_json_object_fallback_when_no_schema() -> None:
@@ -70,6 +73,7 @@ def test_json_object_fallback_when_no_schema() -> None:
 
     sent_payload = mock_post.call_args[1]["json"]
     assert sent_payload["response_format"] == {"type": "json_object"}
+    assert sent_payload["stream"] is False
 
 
 def test_graceful_fallback_on_400() -> None:
@@ -101,6 +105,33 @@ def test_graceful_fallback_on_400() -> None:
 
     # First call should have used json_schema
     assert captured_payloads[0]["response_format"]["type"] == "json_schema"
+    assert captured_payloads[0]["stream"] is False
 
     # Second call should have fallen back to json_object
     assert captured_payloads[1]["response_format"] == {"type": "json_object"}
+    assert captured_payloads[1]["stream"] is False
+
+
+def test_live_openai_compatible_provider_non_streaming_json_response() -> None:
+    """Opt-in smoke test for a local OpenAI-compatible provider that defaults to SSE without stream=false."""
+    if os.getenv("PR_REVIEWER_LIVE_LLM") != "1":
+        pytest.skip("Set PR_REVIEWER_LIVE_LLM=1 to run the live OpenAI-compatible provider smoke test.")
+
+    api_key = os.getenv("PR_REVIEWER_LIVE_API_KEY") or os.getenv("PR_REVIEWER_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        pytest.skip("Set PR_REVIEWER_LIVE_API_KEY to run the live OpenAI-compatible provider smoke test.")
+
+    provider = OpenAICompatibleProvider(
+        api_key=api_key,
+        base_url=os.getenv("PR_REVIEWER_LIVE_BASE_URL", "http://localhost:20128/v1"),
+        timeout_seconds=60,
+        max_retries=1,
+    )
+
+    content = provider.complete_json(
+        model=os.getenv("PR_REVIEWER_LIVE_MODEL", "cc-haiku"),
+        system_prompt="Return only a compact JSON object.",
+        user_prompt='Return exactly {"ok": true}.',
+    )
+
+    assert json.loads(content) == {"ok": True}

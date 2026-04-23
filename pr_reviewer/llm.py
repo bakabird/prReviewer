@@ -81,6 +81,7 @@ class OpenAICompatibleProvider:
             "model": model,
             "temperature": 0.1,
             "response_format": response_format,
+            "stream": False,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
