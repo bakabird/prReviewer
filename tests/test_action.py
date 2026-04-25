@@ -2,6 +2,7 @@
 
 import json
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 
@@ -81,15 +82,32 @@ def test_parse_review_command_supports_full_and_last():
     assert _parse_review_command("@reviewer001 full", "reviewer001") == ReviewCommand(scope="full", count=0)
     assert _parse_review_command("@reviewer001 last", "reviewer001") == ReviewCommand(scope="last", count=1)
     assert _parse_review_command("@reviewer001 last 2", "reviewer001") == ReviewCommand(scope="last", count=2)
+    assert _parse_review_command("@reviewer001 full gpt-5.4", "reviewer001") == ReviewCommand(
+        scope="full",
+        count=0,
+        model="gpt-5.4",
+    )
+    assert _parse_review_command("@reviewer001 last gpt-5.4", "reviewer001") == ReviewCommand(
+        scope="last",
+        count=1,
+        model="gpt-5.4",
+    )
+    assert _parse_review_command("@reviewer001 last 2 gpt-5.4", "reviewer001") == ReviewCommand(
+        scope="last",
+        count=2,
+        model="gpt-5.4",
+    )
 
 
 @pytest.mark.parametrize(
     "body",
     [
         "hello @reviewer001 full",
-        "@reviewer001 full please",
+        "@reviewer001 full gpt-5.4 extra",
         "@reviewer001 last 0",
         "@reviewer001 last -1",
+        "@reviewer001 last 2 gpt-5.4 extra",
+        "@reviewer001 last 2 3",
         "@reviewer001\nfull",
         "@other full",
     ],
@@ -100,6 +118,11 @@ def test_parse_review_command_rejects_non_matching_comments(body):
 
 def test_parse_review_command_escapes_configured_bot_name():
     assert _parse_review_command("@reviewer.001 last 3", "reviewer.001") == ReviewCommand(scope="last", count=3)
+    assert _parse_review_command("@reviewer.001 full gpt-5.4", "reviewer.001") == ReviewCommand(
+        scope="full",
+        count=0,
+        model="gpt-5.4",
+    )
     assert _parse_review_command("@reviewerx001 last 3", "reviewer.001") is None
 
 
@@ -152,7 +175,7 @@ def test_comment_review_request_skips_unauthorized_author(capsys):
 def test_comment_review_request_returns_command_for_pr_comment():
     event = {
         "issue": {"number": 12, "pull_request": {"url": "https://api.github.com/pulls/12"}},
-        "comment": {"body": "@reviewer001 last 2", "author_association": "MEMBER"},
+        "comment": {"body": "@reviewer001 last 2 gpt-5.4", "author_association": "MEMBER"},
     }
 
     result = _resolve_review_request(
@@ -164,7 +187,7 @@ def test_comment_review_request_returns_command_for_pr_comment():
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
 
-    assert result == ("12", ReviewCommand(scope="last", count=2))
+    assert result == ("12", ReviewCommand(scope="last", count=2, model="gpt-5.4"))
 
 
 def test_comment_trigger_skips_non_issue_comment_event(capsys):
@@ -204,6 +227,72 @@ def test_main_skips_non_command_comment_before_requiring_secrets(tmp_path, monke
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "Ignoring non-review command" in captured.out
+
+
+def test_main_uses_comment_model_override(tmp_path, monkeypatch, capsys):
+    captured_run = {}
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({
+            "issue": {"number": 12, "pull_request": {"url": "https://api.github.com/pulls/12"}},
+            "comment": {"body": "@reviewer001 full gpt-5.4", "author_association": "MEMBER"},
+        }),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "issue_comment")
+    monkeypatch.setenv("INPUT_TRIGGER", "comment")
+    monkeypatch.setenv("INPUT_MODEL", "gpt-4.1-mini")
+    monkeypatch.setenv("INPUT_MODE", "multi")
+    monkeypatch.setenv("INPUT_MAX_LINES", "1200")
+    monkeypatch.setenv("INPUT_POST_COMMENTS", "false")
+    monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setattr(run_review, "_fetch_review_diff", lambda repo, pr_number, token, command: SAMPLE_DIFF)
+
+    def fake_run(cmd, capture_output, text):
+        captured_run["cmd"] = cmd
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_review.subprocess, "run", fake_run)
+
+    exit_code = run_review.main()
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "--model" in captured_run["cmd"]
+    assert captured_run["cmd"][captured_run["cmd"].index("--model") + 1] == "gpt-5.4"
+    assert "model=gpt-5.4" in captured.out
+
+
+def test_main_uses_default_model_without_comment_override(tmp_path, monkeypatch, capsys):
+    captured_run = {}
+
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("INPUT_TRIGGER", "pull_request")
+    monkeypatch.setenv("INPUT_MODEL", "gpt-4.1-mini")
+    monkeypatch.setenv("INPUT_MODE", "multi")
+    monkeypatch.setenv("INPUT_MAX_LINES", "1200")
+    monkeypatch.setenv("INPUT_POST_COMMENTS", "false")
+    monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setenv("PR_NUMBER", "12")
+    monkeypatch.setattr(run_review, "_fetch_review_diff", lambda repo, pr_number, token, command: SAMPLE_DIFF)
+
+    def fake_run(cmd, capture_output, text):
+        captured_run["cmd"] = cmd
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_review.subprocess, "run", fake_run)
+
+    exit_code = run_review.main()
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "--model" in captured_run["cmd"]
+    assert captured_run["cmd"][captured_run["cmd"].index("--model") + 1] == "gpt-4.1-mini"
+    assert "model=gpt-4.1-mini" in captured.out
 
 
 def test_fetch_review_diff_for_last_commits_uses_first_target_parent(monkeypatch):

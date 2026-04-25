@@ -18,6 +18,7 @@ from dataclasses import dataclass
 class ReviewCommand:
     scope: str
     count: int = 1
+    model: str | None = None
 
 
 def main() -> int:
@@ -33,7 +34,7 @@ def main() -> int:
     pr_number = _resolve_pull_request_number(event=event)
     repo = os.environ.get("REPO")
     token = os.environ.get("GITHUB_TOKEN")
-    model = os.environ.get("INPUT_MODEL", "gpt-4.1-mini")
+    default_model = os.environ.get("INPUT_MODEL", "gpt-4.1-mini")
     mode = os.environ.get("INPUT_MODE", "multi")
     max_lines = os.environ.get("INPUT_MAX_LINES", "1200")
     exclude = os.environ.get("INPUT_EXCLUDE", "")
@@ -79,6 +80,8 @@ def main() -> int:
         f.write(diff_text)
         diff_path = f.name
 
+    effective_model = command.model or default_model
+
     # Build review command
     cmd = [
         sys.executable,
@@ -89,7 +92,7 @@ def main() -> int:
         "--mode",
         mode,
         "--model",
-        model,
+        effective_model,
         "--max-lines",
         max_lines,
         "--format",
@@ -108,7 +111,7 @@ def main() -> int:
             str(pr_number),
         ])
 
-    print(f"Running review (mode={mode}, model={model})...")
+    print(f"Running review (mode={mode}, model={effective_model})...")
     result = subprocess.run(cmd, capture_output=False, text=True)
 
     # Clean up
@@ -224,16 +227,42 @@ def _parse_review_command(body: str, reviewer_bot_name: str) -> ReviewCommand | 
     command_text = body.replace("\r", "").strip()
     escaped_bot_name = re.escape(reviewer_bot_name)
 
-    full_match = re.fullmatch(rf"@{escaped_bot_name}[ \t]+full", command_text)
-    if full_match:
-        return ReviewCommand(scope="full", count=0)
+    match = re.fullmatch(
+        rf"@{escaped_bot_name}[ \t]+(full|last)(?:[ \t]+(\S+))?(?:[ \t]+(\S+))?",
+        command_text,
+    )
+    if not match:
+        return None
 
-    last_match = re.fullmatch(rf"@{escaped_bot_name}[ \t]+last(?:[ \t]+([1-9][0-9]*))?", command_text)
-    if last_match:
-        count = int(last_match.group(1) or "1")
-        return ReviewCommand(scope="last", count=count)
+    scope, arg1, arg2 = match.groups()
 
-    return None
+    if scope == "full":
+        if arg2 is not None:
+            return None
+        return ReviewCommand(scope="full", count=0, model=arg1)
+
+    if arg1 is None:
+        return ReviewCommand(scope="last", count=1)
+
+    if _is_positive_integer_token(arg1):
+        if arg2 is not None and _is_integer_like_token(arg2):
+            return None
+        return ReviewCommand(scope="last", count=int(arg1), model=arg2)
+
+    if _is_integer_like_token(arg1):
+        return None
+
+    if arg2 is not None:
+        return None
+    return ReviewCommand(scope="last", count=1, model=arg1)
+
+
+def _is_positive_integer_token(token: str) -> bool:
+    return bool(re.fullmatch(r"[1-9][0-9]*", token))
+
+
+def _is_integer_like_token(token: str) -> bool:
+    return bool(re.fullmatch(r"[+-]?[0-9]+", token))
 
 
 def _is_authorized_author_association(author_association: str, allowed_author_associations: str) -> bool:

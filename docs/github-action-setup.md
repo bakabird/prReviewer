@@ -36,7 +36,7 @@ jobs:
 
 ## Triggering reviews from PR comments
 
-Use this workflow when you only want reviews after a maintainer comments with a command such as `@reviewer001 full`, `@reviewer001 last`, or `@reviewer001 last 2`:
+Use this workflow when you only want reviews after a maintainer comments with a command such as `@reviewer001 full`, `@reviewer001 full gpt-5.4`, `@reviewer001 last`, or `@reviewer001 last 2 gpt-5.4`:
 
 ```yaml
 name: AI PR Review Command
@@ -73,7 +73,7 @@ jobs:
           exclude: '*.lock,dist/**,node_modules/**'
 ```
 
-The action ignores ordinary issue comments, non-command PR comments, and comments from users outside `OWNER`, `MEMBER`, or `COLLABORATOR` by default. The built-in `${{ github.token }}` is enough for posting review comments; store only your LLM provider key in a secret such as `LLM_API_KEY`.
+The action ignores ordinary issue comments, non-command PR comments, and comments from users outside `OWNER`, `MEMBER`, or `COLLABORATOR` by default. The workflow `model` input is the default fallback model, and a matching comment can override it for a single run with commands like `@reviewer001 full gpt-5.4` or `@reviewer001 last 2 gpt-5.4`. The built-in `${{ github.token }}` is enough for posting review comments; store only your LLM provider key in a secret such as `LLM_API_KEY`.
 
 ## Using a different LLM provider
 

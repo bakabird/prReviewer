@@ -83,13 +83,21 @@ The example responds only to PR comments from `OWNER`, `MEMBER`, or `COLLABORATO
 
 ```text
 @reviewer001 full
+@reviewer001 full gpt-5.4
 @reviewer001 last
+@reviewer001 last gpt-5.4
 @reviewer001 last 2
+@reviewer001 last 2 gpt-5.4
 ```
 
 - `@reviewer001 full` reviews the full PR diff from base to head.
+- `@reviewer001 full gpt-5.4` reviews the full PR diff with a one-off model override.
 - `@reviewer001 last` reviews the latest commit.
+- `@reviewer001 last gpt-5.4` reviews the latest commit with a one-off model override.
 - `@reviewer001 last N` reviews the latest `N` commits as one combined diff. `N` must be an integer greater than or equal to 1.
+- `@reviewer001 last N gpt-5.4` reviews the latest `N` commits with a one-off model override.
+
+The workflow `model` input remains the default fallback model whenever the comment does not specify one.
 
 Change the reviewer command name in one place:
 
