@@ -158,7 +158,6 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
     max_lines: '1200'          # diff chunk budget per LLM call
     exclude: '*.lock,docs/**'  # glob patterns to skip (comma-separated)
     post_comments: 'true'      # set to 'false' to just print the review without posting
-    fail_on_error: 'false'     # set to 'true' to fail CI when review generation fails
 ```
 
 ## Action inputs
@@ -174,7 +173,6 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
 | `max_lines` | No | `1200` | Max diff lines per review chunk |
 | `exclude` | No | — | Comma-separated glob patterns to skip |
 | `post_comments` | No | `true` | Whether to post inline PR comments |
-| `fail_on_error` | No | `false` | Whether LLM review generation failures fail the workflow |
 | `trigger` | No | `bulk_commit` | `bulk_commit` or `comment` |
 | `reviewer_bot_name` | No | `reviewer001` | Command name for comment-triggered reviews, without `@` |
 | `allowed_author_associations` | No | `OWNER,MEMBER,COLLABORATOR` | Comma-separated GitHub author associations allowed to trigger comment reviews |
@@ -190,7 +188,7 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
 7. Aggregates all configured model results into one final review
 8. Posts findings as inline review comments on the changed lines
 
-The removed `trigger: auto` and `trigger: pull_request` modes are rejected. `models` is all-or-nothing: if any configured model fails, the action stops before posting comments and before advancing the hidden last-reviewed SHA. By default, review generation failures are reported as workflow warnings so transient LLM provider issues do not block CI; set `fail_on_error: 'true'` to make those failures fail the workflow. Multiple models multiply latency and provider cost.
+The removed `trigger: auto` and `trigger: pull_request` modes are rejected. `models` is all-or-nothing: if any configured model fails, the action fails, stops before posting comments, and does not advance the hidden last-reviewed SHA. Multiple models multiply latency and provider cost.
 
 ## CLI usage
 

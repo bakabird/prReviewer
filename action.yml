@@ -42,10 +42,6 @@ inputs:
     description: 'Whether to post inline comments on the PR'
     required: false
     default: 'true'
-  fail_on_error:
-    description: 'Whether LLM review generation failures should fail the workflow'
-    required: false
-    default: 'false'
   trigger:
     description: 'Review trigger mode: bulk_commit or comment'
     required: false
@@ -84,7 +80,6 @@ runs:
         INPUT_MAX_LINES: ${{ inputs.max_lines }}
         INPUT_EXCLUDE: ${{ inputs.exclude }}
         INPUT_POST_COMMENTS: ${{ inputs.post_comments }}
-        INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
         INPUT_TRIGGER: ${{ inputs.trigger }}
         INPUT_REVIEWER_BOT_NAME: ${{ inputs.reviewer_bot_name }}
         INPUT_ALLOWED_AUTHOR_ASSOCIATIONS: ${{ inputs.allowed_author_associations }}
