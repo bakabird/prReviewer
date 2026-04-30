@@ -12,6 +12,12 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
+
+
+STATE_MARKER_NAME = "pr-reviewer-state"
+STATE_MARKER_PREFIX = f"<!-- {STATE_MARKER_NAME}"
+STATE_MARKER_SUFFIX = "-->"
 
 
 @dataclass(frozen=True)
@@ -19,12 +25,15 @@ class ReviewCommand:
     scope: str
     count: int = 1
     model: str | None = None
+    start_sha: str | None = None
+    head_sha: str | None = None
+    update_state: bool = False
 
 
 def main() -> int:
     event = _load_github_event(os.environ.get("GITHUB_EVENT_PATH"))
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    trigger = os.environ.get("INPUT_TRIGGER", "auto").strip().lower()
+    trigger = os.environ.get("INPUT_TRIGGER", "bulk_commit").strip().lower()
     reviewer_bot_name = os.environ.get("INPUT_REVIEWER_BOT_NAME", "reviewer001")
     allowed_author_associations = os.environ.get(
         "INPUT_ALLOWED_AUTHOR_ASSOCIATIONS",
@@ -35,6 +44,7 @@ def main() -> int:
     repo = os.environ.get("REPO")
     token = os.environ.get("GITHUB_TOKEN")
     default_model = os.environ.get("INPUT_MODEL", "gpt-4.1-mini")
+    models_input = os.environ.get("INPUT_MODELS", "")
     mode = os.environ.get("INPUT_MODE", "multi")
     max_lines = os.environ.get("INPUT_MAX_LINES", "1200")
     exclude = os.environ.get("INPUT_EXCLUDE", "")
@@ -81,6 +91,7 @@ def main() -> int:
         diff_path = f.name
 
     effective_model = command.model or default_model
+    effective_models = _parse_models_input(models_input, fallback_model=effective_model)
 
     # Build review command
     cmd = [
@@ -91,8 +102,6 @@ def main() -> int:
         diff_path,
         "--mode",
         mode,
-        "--model",
-        effective_model,
         "--max-lines",
         max_lines,
         "--format",
@@ -100,6 +109,10 @@ def main() -> int:
         "--color",
         "never",
     ]
+    if len(effective_models) == 1:
+        cmd.extend(["--model", effective_models[0]])
+    else:
+        cmd.extend(["--models", ",".join(effective_models)])
 
     if post_comments:
         cmd.extend([
@@ -111,7 +124,8 @@ def main() -> int:
             str(pr_number),
         ])
 
-    print(f"Running review (mode={mode}, model={effective_model})...")
+    model_label = ",".join(effective_models)
+    print(f"Running review (mode={mode}, model={model_label})...")
     result = subprocess.run(cmd, capture_output=False, text=True)
 
     # Clean up
@@ -120,8 +134,17 @@ def main() -> int:
 
     if result.returncode != 0:
         print(f"::warning::Review exited with code {result.returncode}")
+        return result.returncode
 
-    return result.returncode
+    if post_comments and command.update_state and command.head_sha:
+        try:
+            _write_review_state(repo, pr_number, token, command.head_sha)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            print("::error::Review completed but failed to persist last reviewed SHA.", file=sys.stderr)
+            return code or 1
+
+    return 0
 
 
 def _load_github_event(event_path: str | None) -> dict:
@@ -163,12 +186,12 @@ def _resolve_review_request(
     reviewer_bot_name: str,
     allowed_author_associations: str,
 ) -> tuple[str, ReviewCommand] | None:
-    if trigger not in {"auto", "pull_request", "comment"}:
+    if trigger not in {"bulk_commit", "comment"}:
         print(f"::error::Unsupported trigger input: {trigger}", file=sys.stderr)
         raise SystemExit(1)
 
     if event_name == "issue_comment":
-        if trigger == "pull_request":
+        if trigger == "bulk_commit":
             print("Not a pull_request review trigger. Skipping.")
             return None
         return _resolve_comment_review_request(
@@ -182,11 +205,25 @@ def _resolve_review_request(
         print("Not an issue_comment event. Skipping.")
         return None
 
+    if event_name != "pull_request":
+        print("Not a pull_request event. Skipping.")
+        return None
+
+    action = str(event.get("action") or "")
+    if action not in {"opened", "synchronize"}:
+        print(f"Unsupported pull_request action for bulk_commit: {action or 'UNKNOWN'}. Skipping.")
+        return None
+
     if not pr_number:
         print("Not a pull request. Skipping.")
         return None
 
-    return pr_number, ReviewCommand(scope="full", count=0)
+    pull_request = event.get("pull_request") if isinstance(event.get("pull_request"), dict) else {}
+    head_sha = str(pull_request.get("head", {}).get("sha") or "")
+    if action == "opened":
+        return pr_number, ReviewCommand(scope="full", count=0, head_sha=head_sha, update_state=True)
+
+    return pr_number, ReviewCommand(scope="bulk_range", count=0, head_sha=head_sha, update_state=True)
 
 
 def _resolve_comment_review_request(
@@ -278,6 +315,24 @@ def _fetch_review_diff(repo: str, pr_number: str, token: str | None, command: Re
     if command.scope == "full":
         return _fetch_pr_diff(repo, pr_number, token)
 
+    if command.scope == "bulk_range":
+        pr_payload = _fetch_pr_metadata(repo, pr_number, token)
+        head_sha = command.head_sha or str(pr_payload.get("head", {}).get("sha") or "")
+        compare_repo = _head_repo_full_name(pr_payload) or repo
+        state = _read_review_state(repo, pr_number, token)
+        start_sha = state.last_reviewed_sha if state else None
+        if start_sha and head_sha:
+            try:
+                print(f"Reviewing new commits: {start_sha}...{head_sha}")
+                return _fetch_compare_diff(compare_repo, start_sha, head_sha, token)
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+                print(
+                    "Stored review state could not be compared "
+                    f"(GitHub compare exited with {code}); falling back to full PR diff."
+                )
+        return _fetch_pr_diff(repo, pr_number, token)
+
     commits = _fetch_pr_commits(repo, pr_number, token)
     if not commits:
         return ""
@@ -336,6 +391,95 @@ def _fetch_pr_commits(repo: str, pr_number: str, token: str | None) -> list[dict
     return commits
 
 
+@dataclass(frozen=True)
+class ReviewState:
+    comment_id: int | None
+    last_reviewed_sha: str
+    updated_at: str
+    version: int = 1
+
+
+def _parse_models_input(models_input: str, *, fallback_model: str) -> list[str]:
+    models = [model.strip() for model in models_input.split(",") if model.strip()]
+    return models or [fallback_model]
+
+
+def _read_review_state(repo: str, pr_number: str, token: str | None) -> ReviewState | None:
+    comment = _find_state_comment(repo, pr_number, token)
+    if comment is None:
+        return None
+    state = _extract_state_from_comment(str(comment.get("body") or ""))
+    if state is None:
+        return None
+    return ReviewState(
+        comment_id=int(comment["id"]) if comment.get("id") else None,
+        last_reviewed_sha=state["last_reviewed_sha"],
+        updated_at=state["updated_at"],
+        version=int(state.get("version", 1)),
+    )
+
+
+def _write_review_state(repo: str, pr_number: str, token: str | None, head_sha: str) -> None:
+    payload = {
+        "version": 1,
+        "last_reviewed_sha": head_sha,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    body = _format_state_comment(payload)
+    comment = _find_state_comment(repo, pr_number, token)
+    if comment and comment.get("id"):
+        _patch_github_json(
+            f"https://api.github.com/repos/{repo}/issues/comments/{comment['id']}",
+            token,
+            {"body": body},
+        )
+        return
+    _post_github_json(
+        f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+        token,
+        {"body": body},
+    )
+
+
+def _find_state_comment(repo: str, pr_number: str, token: str | None) -> dict | None:
+    page = 1
+    while True:
+        url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}"
+        payload = _fetch_github_json(url, token)
+        if not isinstance(payload, list):
+            return None
+        for comment in payload:
+            if isinstance(comment, dict) and STATE_MARKER_PREFIX in str(comment.get("body") or ""):
+                return comment
+        if len(payload) < 100:
+            return None
+        page += 1
+
+
+def _extract_state_from_comment(body: str) -> dict | None:
+    start = body.find(STATE_MARKER_PREFIX)
+    if start < 0:
+        return None
+    json_start = start + len(STATE_MARKER_PREFIX)
+    end = body.find(STATE_MARKER_SUFFIX, json_start)
+    if end < 0:
+        return None
+    try:
+        payload = json.loads(body[json_start:end].strip())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != 1 or not payload.get("last_reviewed_sha"):
+        return None
+    return payload
+
+
+def _format_state_comment(payload: dict) -> str:
+    state_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return f"{STATE_MARKER_PREFIX}\n{state_json}\n{STATE_MARKER_SUFFIX}"
+
+
 def _fetch_github_json(url: str, token: str | None):
     response = _curl_github(url, token, accept="application/vnd.github+json")
     try:
@@ -368,6 +512,40 @@ def _curl_github(url: str, token: str | None, *, accept: str) -> str:
         print(f"::error::GitHub API request failed: {proc.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
     return proc.stdout
+
+
+def _post_github_json(url: str, token: str | None, payload: dict) -> None:
+    _send_github_json("POST", url, token, payload)
+
+
+def _patch_github_json(url: str, token: str | None, payload: dict) -> None:
+    _send_github_json("PATCH", url, token, payload)
+
+
+def _send_github_json(method: str, url: str, token: str | None, payload: dict) -> None:
+    cmd = [
+        "curl",
+        "-sS",
+        "-f",
+        "-X",
+        method,
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        "-d",
+        json.dumps(payload),
+    ]
+    if token:
+        cmd.extend(["-H", f"Authorization: Bearer {token}"])
+    cmd.append(url)
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"::error::GitHub API request failed: {proc.stderr.strip()}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def _first_parent_sha(commit: dict) -> str | None:

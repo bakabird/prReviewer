@@ -1,7 +1,10 @@
 import json
 
 from pr_reviewer.llm import LLMError
-from pr_reviewer.reviewer import PRReviewer
+import pytest
+
+from pr_reviewer.models import Category, DiffStats, ReviewFinding, ReviewResult, Severity, Verdict
+from pr_reviewer.reviewer import PRReviewer, aggregate_review_results
 
 SAMPLE_DIFF = """diff --git a/app/main.py b/app/main.py
 index 1111111..2222222 100644
@@ -476,3 +479,184 @@ def test_review_with_file_context_included_in_prompt(sample_diff: str) -> None:
     assert "app/main.py" in captured_prompts[0], "File context not injected into prompt"
     assert "def foo():" in captured_prompts[0], "File content not in prompt"
     assert "File context" in captured_prompts[0], "Context label not in prompt"
+
+
+def test_review_many_runs_models_in_configured_order() -> None:
+    provider = FakeProvider([
+        json.dumps({"summary": "first ok", "verdict": "looks good", "findings": []}),
+        json.dumps({"summary": "second ok", "verdict": "looks good", "findings": []}),
+    ])
+    seen_models: list[str] = []
+    original_complete_json = provider.complete_json
+
+    def capture_model(**kwargs):
+        seen_models.append(kwargs["model"])
+        return original_complete_json(**kwargs)
+
+    provider.complete_json = capture_model
+    reviewer = PRReviewer(provider)
+
+    result = reviewer.review_many(diff_text=SAMPLE_DIFF, models=["model-a", "model-b"], review_mode="single")
+
+    assert seen_models == ["model-a", "model-b"]
+    assert result.model == "aggregate(model-a,model-b)"
+    assert "model-a, model-b" in result.summary
+
+
+def test_review_many_uses_single_model_fallback_path() -> None:
+    provider = FakeProvider([
+        json.dumps({"summary": "single ok", "verdict": "looks good", "findings": []}),
+    ])
+    reviewer = PRReviewer(provider)
+
+    result = reviewer.review_many(diff_text=SAMPLE_DIFF, models=["fallback"], review_mode="single")
+
+    assert result.model == "fallback"
+    assert result.summary == "single ok"
+
+
+def test_review_many_model_failure_blocks_aggregation() -> None:
+    class ExplodingProvider:
+        def complete_json(self, *, model, system_prompt, user_prompt, json_schema=None):
+            if model == "bad":
+                raise RuntimeError("provider exploded")
+            return json.dumps({"summary": "ok", "verdict": "looks good", "findings": []})
+
+    reviewer = PRReviewer(ExplodingProvider())
+
+    with pytest.raises(RuntimeError):
+        reviewer.review_many(diff_text=SAMPLE_DIFF, models=["ok", "bad"], review_mode="single")
+
+
+def test_review_many_handled_llm_failure_blocks_aggregation() -> None:
+    reviewer = PRReviewer(FailingProvider("Request timed out"))
+
+    with pytest.raises(LLMError):
+        reviewer.review_many(diff_text=SAMPLE_DIFF, models=["bad", "other"], review_mode="single")
+
+
+def test_aggregate_review_results_dedupes_and_selects_highest_risk_verdict() -> None:
+    duplicate_a = ReviewFinding(
+        severity=Severity.medium,
+        category=Category.bug,
+        title="Null value can crash request",
+        explanation="The added code dereferences a value without a None check.",
+        file="app/main.py",
+        line=2,
+        confidence=0.75,
+    )
+    duplicate_b = ReviewFinding(
+        severity=Severity.high,
+        category=Category.bug,
+        title="Null value can crash the request",
+        explanation="The same dereference can crash when the value is None.",
+        file="app/main.py",
+        line=2,
+        confidence=0.92,
+    )
+    diff = DiffStats(files=["app/main.py"], files_changed=1, additions=1, deletions=1, line_count=6)
+
+    result = aggregate_review_results(
+        [
+            ReviewResult(
+                summary="first",
+                verdict=Verdict.needs_attention,
+                findings=[duplicate_a],
+                model="model-a",
+                diff=diff,
+                passes_run=["general"],
+            ),
+            ReviewResult(
+                summary="second",
+                verdict=Verdict.high_risk,
+                findings=[duplicate_b],
+                model="model-b",
+                diff=diff,
+                passes_run=["general"],
+            ),
+        ],
+        models=["model-a", "model-b"],
+    )
+
+    assert result.model == "aggregate(model-a,model-b)"
+    assert result.verdict == Verdict.high_risk
+    assert len(result.findings) == 1
+    assert result.findings[0].severity == Severity.high
+    assert any("across configured models" in warning for warning in result.warnings)
+
+
+def test_aggregate_review_results_rejects_mismatched_metadata() -> None:
+    first_diff = DiffStats(files=["app/a.py"], files_changed=1, additions=1, deletions=0, line_count=5)
+    second_diff = DiffStats(files=["app/b.py"], files_changed=1, additions=1, deletions=0, line_count=5)
+
+    with pytest.raises(ValueError, match="different diffs"):
+        aggregate_review_results(
+            [
+                ReviewResult(
+                    summary="first",
+                    verdict=Verdict.looks_good,
+                    findings=[],
+                    model="model-a",
+                    diff=first_diff,
+                    review_mode="single",
+                ),
+                ReviewResult(
+                    summary="second",
+                    verdict=Verdict.looks_good,
+                    findings=[],
+                    model="model-b",
+                    diff=second_diff,
+                    review_mode="single",
+                ),
+            ],
+            models=["model-a", "model-b"],
+        )
+
+
+def test_duplicate_finding_merge_preserves_alternative_fix() -> None:
+    diff = DiffStats(files=["app/main.py"], files_changed=1, additions=1, deletions=1, line_count=6)
+    first = ReviewFinding(
+        severity=Severity.medium,
+        category=Category.bug,
+        title="Null value can crash request",
+        explanation="The added code dereferences a value without a None check.",
+        file="app/main.py",
+        line=2,
+        confidence=0.75,
+        suggested_fix="Return early when value is None.",
+    )
+    second = ReviewFinding(
+        severity=Severity.medium,
+        category=Category.bug,
+        title="Null value can crash the request",
+        explanation="The same dereference can crash when the value is None.",
+        file="app/main.py",
+        line=2,
+        confidence=0.80,
+        suggested_fix="Validate value before calling the helper.",
+    )
+
+    result = aggregate_review_results(
+        [
+            ReviewResult(
+                summary="first",
+                verdict=Verdict.needs_attention,
+                findings=[first],
+                model="model-a",
+                diff=diff,
+            ),
+            ReviewResult(
+                summary="second",
+                verdict=Verdict.needs_attention,
+                findings=[second],
+                model="model-b",
+                diff=diff,
+            ),
+        ],
+        models=["model-a", "model-b"],
+    )
+
+    assert len(result.findings) == 1
+    assert "Return early" in result.findings[0].suggested_fix
+    assert "Validate value" in result.findings[0].suggested_fix
+    assert "Alternative:" in result.findings[0].suggested_fix

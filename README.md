@@ -20,6 +20,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 jobs:
   review:
     runs-on: ubuntu-latest
@@ -28,13 +29,19 @@ jobs:
         with:
           api_key: ${{ secrets.OPENAI_API_KEY }}
           github_token: ${{ github.token }}
-          trigger: pull_request
+          trigger: bulk_commit
           mode: multi
           max_lines: '1200'
           exclude: '*.lock,dist/**,node_modules/**'
 ```
 
-`opened` runs the review when the PR is created. `synchronize` runs it again when new commits are pushed to the PR branch.
+You can also copy [examples/workflows/bulk-commit-pr-review.yml](examples/workflows/bulk-commit-pr-review.yml) as a starting point, or use [examples/workflows/bulk-commit-pr-review-tailscale.yml](examples/workflows/bulk-commit-pr-review-tailscale.yml) when your LLM endpoint is only reachable through Tailscale.
+
+`opened` reviews the full PR diff when the PR is created. `synchronize` reviews the commit range from the last successfully reviewed SHA to the current head SHA. The action stores that SHA in a hidden PR marker comment, so automatic workflows need `issues: write` in addition to `pull-requests: write`.
+
+If the hidden state marker comment is deleted or contains a SHA that can no longer be compared to the PR head, the next `synchronize` run falls back to a safe full PR review instead of skipping commits.
+
+Short-window commit batching is not implemented. Each `synchronize` event is eligible for review according to the stored last reviewed SHA.
 
 `mode: multi` runs separate correctness, security, and performance passes before merging the findings. `max_lines: '1200'` is the approximate diff-line budget per LLM request; lower it to make smaller requests, or raise it to reduce chunking for large diffs.
 
@@ -42,7 +49,7 @@ jobs:
 
 ## Trigger reviews from PR comments
 
-If you want AI review to run only when a maintainer asks for it, use an `issue_comment` workflow instead of the automatic `pull_request` trigger. Copy [examples/workflows/pr-review-command.yml](examples/workflows/pr-review-command.yml) to `.github/workflows/ai-pr-review.yml`.
+If you want AI review to run only when a maintainer asks for it, use an `issue_comment` workflow instead of the automatic `bulk_commit` trigger. Copy [examples/workflows/ai-pr-review.yml](examples/workflows/ai-pr-review.yml) to `.github/workflows/ai-pr-review.yml`.
 
 The workflow stays small because the action handles command parsing, PR lookup, commit range selection, patch fetching, and GitHub posting:
 
@@ -112,7 +119,7 @@ The command-triggered workflow grants `issues: read` in addition to `contents: r
 
 ### Required workflow permissions
 
-The job **must** grant the token permission to read the repo and write pull-request review comments. Without `pull-requests: write`, the workflow can appear to succeed while comment creation fails (often with API errors that are easy to miss).
+The job **must** grant the token permission to read the repo, write pull-request review comments, and create or update the hidden state marker comment. Without these permissions, the workflow can appear to succeed while GitHub API writes fail.
 
 Add this at the **job** or **workflow** level (the quickstart example above already includes it):
 
@@ -120,9 +127,10 @@ Add this at the **job** or **workflow** level (the quickstart example above alre
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 ```
 
-If you use a custom `github_token`, ensure that token has the same scopes.
+If you use `trigger: comment`, `issues: read` is sufficient for the triggering comment workflow unless that workflow also needs to update review state. If you use a custom `github_token`, ensure that token has the same scopes.
 
 ## What you get
 
@@ -145,6 +153,7 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
     api_key: ${{ secrets.OPENAI_API_KEY }}
     mode: 'multi'              # 'single' (faster) or 'multi' (deeper: correctness + security + performance)
     model: 'gpt-4.1-mini'     # any OpenAI-compatible model
+    models: ''                 # optional comma-separated ordered models; overrides model when set
     base_url: 'https://api.openai.com/v1'  # or any compatible provider
     max_lines: '1200'          # diff chunk budget per LLM call
     exclude: '*.lock,docs/**'  # glob patterns to skip (comma-separated)
@@ -157,13 +166,14 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
 |-------|----------|---------|-------------|
 | `api_key` | Yes | — | API key for OpenAI (or compatible provider) |
 | `github_token` | No | `${{ github.token }}` | Token for posting review comments |
-| `model` | No | `gpt-4.1-mini` | LLM model identifier |
+| `model` | No | `gpt-4.1-mini` | Single fallback LLM model identifier |
+| `models` | No | — | Ordered comma-separated models. Takes precedence over `model` |
 | `mode` | No | `multi` | `single` (fast) or `multi` (deep, multi-pass) |
 | `base_url` | No | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
 | `max_lines` | No | `1200` | Max diff lines per review chunk |
 | `exclude` | No | — | Comma-separated glob patterns to skip |
 | `post_comments` | No | `true` | Whether to post inline PR comments |
-| `trigger` | No | `auto` | `auto`, `pull_request`, or `comment` |
+| `trigger` | No | `bulk_commit` | `bulk_commit` or `comment` |
 | `reviewer_bot_name` | No | `reviewer001` | Command name for comment-triggered reviews, without `@` |
 | `allowed_author_associations` | No | `OWNER,MEMBER,COLLABORATOR` | Comma-separated GitHub author associations allowed to trigger comment reviews |
 
@@ -174,8 +184,11 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
 3. Splits large diffs into reviewable chunks
 4. Sends each chunk through the LLM with a structured review prompt
 5. In `multi` mode, runs separate correctness, security, and performance passes, then dedupes
-6. Synthesizes findings across chunks into a coherent summary
-7. Posts findings as inline review comments on the changed lines
+6. If `models` is configured, runs each model sequentially against the same selected diff
+7. Aggregates all configured model results into one final review
+8. Posts findings as inline review comments on the changed lines
+
+The removed `trigger: auto` and `trigger: pull_request` modes are rejected. `models` is all-or-nothing: if any configured model fails, the action fails before posting comments and before advancing the hidden last-reviewed SHA. Multiple models multiply latency and provider cost.
 
 ## CLI usage
 

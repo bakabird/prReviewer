@@ -15,9 +15,13 @@ inputs:
     required: false
     default: ${{ github.token }}
   model:
-    description: 'LLM model identifier'
+    description: 'Single LLM model identifier, used when models is empty'
     required: false
     default: 'gpt-4.1-mini'
+  models:
+    description: 'Ordered comma-separated LLM model identifiers. Takes precedence over model when set.'
+    required: false
+    default: ''
   mode:
     description: 'Review mode: single (faster) or multi (deeper, multi-pass)'
     required: false
@@ -39,9 +43,9 @@ inputs:
     required: false
     default: 'true'
   trigger:
-    description: 'Review trigger mode: auto, pull_request, or comment'
+    description: 'Review trigger mode: bulk_commit or comment'
     required: false
-    default: 'auto'
+    default: 'bulk_commit'
   reviewer_bot_name:
     description: 'Bot command name for comment-triggered reviews, without the leading @'
     required: false
@@ -71,6 +75,7 @@ runs:
         PR_REVIEWER_BASE_URL: ${{ inputs.base_url }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
         INPUT_MODEL: ${{ inputs.model }}
+        INPUT_MODELS: ${{ inputs.models }}
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_MAX_LINES: ${{ inputs.max_lines }}
         INPUT_EXCLUDE: ${{ inputs.exclude }}

@@ -14,6 +14,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 jobs:
   review:
     runs-on: ubuntu-latest
@@ -22,13 +23,19 @@ jobs:
         with:
           api_key: ${{ secrets.OPENAI_API_KEY }}
           github_token: ${{ github.token }}
-          trigger: pull_request
+          trigger: bulk_commit
           mode: multi
           max_lines: '1200'
           exclude: '*.lock,dist/**,node_modules/**'
 ```
 
-`opened` runs the review when the PR is created. `synchronize` runs it again when new commits are pushed to the PR branch.
+You can also copy `examples/workflows/bulk-commit-pr-review.yml` as a starting point, or use `examples/workflows/bulk-commit-pr-review-tailscale.yml` when your LLM endpoint is only reachable through Tailscale.
+
+`opened` reviews the full PR diff when the PR is created. `synchronize` reviews the commit range from the last successfully reviewed SHA to the current head SHA. The action stores that SHA in a hidden PR marker comment, so automatic workflows need `issues: write` in addition to `pull-requests: write`.
+
+If the hidden state marker comment is deleted or contains a SHA that can no longer be compared to the PR head, the next `synchronize` run falls back to a safe full PR review instead of skipping commits.
+
+Short-window commit batching is not implemented. Each `synchronize` event is eligible for review according to the stored last reviewed SHA.
 
 `mode: multi` runs separate correctness, security, and performance passes before merging the findings. `max_lines: '1200'` is the approximate diff-line budget per LLM request; lower it to make smaller requests, or raise it to reduce chunking for large diffs.
 
@@ -74,6 +81,22 @@ jobs:
 ```
 
 The action ignores ordinary issue comments, non-command PR comments, and comments from users outside `OWNER`, `MEMBER`, or `COLLABORATOR` by default. The workflow `model` input is the default fallback model, and a matching comment can override it for a single run with commands like `@reviewer001 full gpt-5.4` or `@reviewer001 last 2 gpt-5.4`. The built-in `${{ github.token }}` is enough for posting review comments; store only your LLM provider key in a secret such as `LLM_API_KEY`.
+
+For automatic reviews, configure `trigger: bulk_commit`. The removed `trigger: auto` and `trigger: pull_request` modes are rejected.
+
+## Multiple models
+
+Use `models` to run more than one configured model against the same selected diff:
+
+```yaml
+- uses: bakabird/prReviewer@v1.1
+  with:
+    api_key: ${{ secrets.OPENAI_API_KEY }}
+    trigger: bulk_commit
+    models: 'gpt-4.1-mini,gpt-4.1'
+```
+
+`models` takes precedence over `model`. When `models` is empty, the action falls back to `model`. Models run sequentially in the configured order, and the action posts one aggregated result after all models complete. If any configured model fails, the whole review fails before posting and before advancing the hidden last-reviewed SHA. Multiple models multiply latency and provider cost, so tune `models`, `mode`, `exclude`, and `max_lines` together.
 
 ## Using a different LLM provider
 
@@ -131,6 +154,6 @@ Set `post_comments: 'false'` to print the review in the action log without posti
 ## Troubleshooting
 
 - **No comments posted**: Check that `api_key` is set and the LLM provider is reachable. Look at the action logs.
-- **Permission errors**: The workflow needs `pull-requests: write` in the `permissions` block.
+- **Permission errors**: Automatic `bulk_commit` workflows need `pull-requests: write` and `issues: write` in the `permissions` block.
 - **Rate limited**: The action retries with backoff, but very large PRs with `multi` mode make 3x the API calls. Try `mode: 'single'` or increase `max_lines`.
 - **Wrong model**: Make sure `model` matches what your `base_url` provider supports.

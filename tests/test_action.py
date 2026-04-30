@@ -9,11 +9,15 @@ import pytest
 from action import run_review
 from action.run_review import (
     ReviewCommand,
+    ReviewState,
+    _extract_state_from_comment,
     _fetch_review_diff,
     _filter_diff,
+    _format_state_comment,
     _is_authorized_author_association,
     _matches_any,
     _parse_review_command,
+    _parse_models_input,
     _resolve_review_request,
 )
 
@@ -207,6 +211,83 @@ def test_comment_trigger_skips_non_issue_comment_event(capsys):
     assert "Not an issue_comment event" in captured.out
 
 
+@pytest.mark.parametrize("trigger", ["auto", "pull_request"])
+def test_removed_trigger_modes_are_rejected(trigger):
+    with pytest.raises(SystemExit):
+        _resolve_review_request(
+            trigger=trigger,
+            event_name="pull_request",
+            event={"action": "opened", "pull_request": {"number": 12}},
+            pr_number="12",
+            reviewer_bot_name="reviewer001",
+            allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
+        )
+
+
+def test_bulk_commit_skips_comment_events(capsys):
+    result = _resolve_review_request(
+        trigger="bulk_commit",
+        event_name="issue_comment",
+        event={"issue": {"number": 12, "pull_request": {}}, "comment": {"body": "@reviewer001 full"}},
+        pr_number="12",
+        reviewer_bot_name="reviewer001",
+        allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
+    )
+
+    captured = capsys.readouterr()
+    assert result is None
+    assert "Not a pull_request review trigger" in captured.out
+
+
+def test_bulk_commit_opened_routes_full_review():
+    result = _resolve_review_request(
+        trigger="bulk_commit",
+        event_name="pull_request",
+        event={"action": "opened", "pull_request": {"number": 12, "head": {"sha": "head1"}}},
+        pr_number="12",
+        reviewer_bot_name="reviewer001",
+        allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
+    )
+
+    assert result == ("12", ReviewCommand(scope="full", count=0, head_sha="head1", update_state=True))
+
+
+def test_bulk_commit_synchronize_routes_range_review():
+    result = _resolve_review_request(
+        trigger="bulk_commit",
+        event_name="pull_request",
+        event={"action": "synchronize", "pull_request": {"number": 12, "head": {"sha": "head2"}}},
+        pr_number="12",
+        reviewer_bot_name="reviewer001",
+        allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
+    )
+
+    assert result == ("12", ReviewCommand(scope="bulk_range", count=0, head_sha="head2", update_state=True))
+
+
+def test_bulk_commit_skips_unsupported_pull_request_actions(capsys):
+    result = _resolve_review_request(
+        trigger="bulk_commit",
+        event_name="pull_request",
+        event={"action": "closed", "pull_request": {"number": 12}},
+        pr_number="12",
+        reviewer_bot_name="reviewer001",
+        allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
+    )
+
+    captured = capsys.readouterr()
+    assert result is None
+    assert "Unsupported pull_request action" in captured.out
+
+
+def test_models_input_takes_precedence_over_model():
+    assert _parse_models_input("gpt-5.4, gpt-4.1-mini", fallback_model="fallback") == [
+        "gpt-5.4",
+        "gpt-4.1-mini",
+    ]
+    assert _parse_models_input("", fallback_model="fallback") == ["fallback"]
+
+
 def test_main_skips_non_command_comment_before_requiring_secrets(tmp_path, monkeypatch, capsys):
     event_path = tmp_path / "event.json"
     event_path.write_text(
@@ -268,9 +349,15 @@ def test_main_uses_comment_model_override(tmp_path, monkeypatch, capsys):
 
 def test_main_uses_default_model_without_comment_override(tmp_path, monkeypatch, capsys):
     captured_run = {}
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"action": "opened", "pull_request": {"number": 12, "head": {"sha": "head"}}}),
+        encoding="utf-8",
+    )
 
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
-    monkeypatch.setenv("INPUT_TRIGGER", "pull_request")
+    monkeypatch.setenv("INPUT_TRIGGER", "bulk_commit")
     monkeypatch.setenv("INPUT_MODEL", "gpt-4.1-mini")
     monkeypatch.setenv("INPUT_MODE", "multi")
     monkeypatch.setenv("INPUT_MAX_LINES", "1200")
@@ -293,6 +380,42 @@ def test_main_uses_default_model_without_comment_override(tmp_path, monkeypatch,
     assert "--model" in captured_run["cmd"]
     assert captured_run["cmd"][captured_run["cmd"].index("--model") + 1] == "gpt-4.1-mini"
     assert "model=gpt-4.1-mini" in captured.out
+
+
+def test_main_uses_models_input_order(tmp_path, monkeypatch, capsys):
+    captured_run = {}
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"action": "opened", "pull_request": {"number": 12, "head": {"sha": "head"}}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("INPUT_TRIGGER", "bulk_commit")
+    monkeypatch.setenv("INPUT_MODEL", "fallback")
+    monkeypatch.setenv("INPUT_MODELS", "gpt-5.4, gpt-4.1-mini")
+    monkeypatch.setenv("INPUT_MODE", "multi")
+    monkeypatch.setenv("INPUT_MAX_LINES", "1200")
+    monkeypatch.setenv("INPUT_POST_COMMENTS", "false")
+    monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setenv("PR_NUMBER", "12")
+    monkeypatch.setattr(run_review, "_fetch_review_diff", lambda repo, pr_number, token, command: SAMPLE_DIFF)
+
+    def fake_run(cmd, capture_output, text):
+        captured_run["cmd"] = cmd
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_review.subprocess, "run", fake_run)
+
+    exit_code = run_review.main()
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "--models" in captured_run["cmd"]
+    assert captured_run["cmd"][captured_run["cmd"].index("--models") + 1] == "gpt-5.4,gpt-4.1-mini"
+    assert "model=gpt-5.4,gpt-4.1-mini" in captured.out
 
 
 def test_fetch_review_diff_for_last_commits_uses_first_target_parent(monkeypatch):
@@ -391,3 +514,217 @@ def test_fetch_review_diff_for_full_uses_pr_diff(monkeypatch):
     diff = _fetch_review_diff("owner/repo", "12", "token", ReviewCommand(scope="full", count=0))
 
     assert diff == "full diff"
+
+
+def test_state_comment_round_trip():
+    body = _format_state_comment(
+        {"version": 1, "last_reviewed_sha": "abc123", "updated_at": "2026-04-30T00:00:00+00:00"}
+    )
+
+    assert _extract_state_from_comment(body) == {
+        "version": 1,
+        "last_reviewed_sha": "abc123",
+        "updated_at": "2026-04-30T00:00:00+00:00",
+    }
+    assert _extract_state_from_comment("ordinary comment") is None
+
+
+def test_bulk_range_uses_stored_last_reviewed_sha(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(
+        run_review,
+        "_fetch_pr_metadata",
+        lambda repo, pr_number, token: {"head": {"sha": "head", "repo": {"full_name": "fork/repo"}}},
+    )
+    monkeypatch.setattr(
+        run_review,
+        "_read_review_state",
+        lambda repo, pr_number, token: ReviewState(
+            comment_id=99,
+            last_reviewed_sha="base",
+            updated_at="2026-04-30T00:00:00+00:00",
+        ),
+    )
+
+    def fake_fetch_compare_diff(repo, start_sha, head_sha, token):
+        calls["compare"] = (repo, start_sha, head_sha, token)
+        return "range diff"
+
+    monkeypatch.setattr(run_review, "_fetch_compare_diff", fake_fetch_compare_diff)
+
+    diff = _fetch_review_diff(
+        "owner/repo",
+        "12",
+        "token",
+        ReviewCommand(scope="bulk_range", count=0, head_sha="head"),
+    )
+
+    assert diff == "range diff"
+    assert calls["compare"] == ("fork/repo", "base", "head", "token")
+
+
+def test_bulk_range_missing_state_falls_back_to_full_pr(monkeypatch):
+    monkeypatch.setattr(
+        run_review,
+        "_fetch_pr_metadata",
+        lambda repo, pr_number, token: {"head": {"sha": "head", "repo": {"full_name": "fork/repo"}}},
+    )
+    monkeypatch.setattr(run_review, "_read_review_state", lambda repo, pr_number, token: None)
+    monkeypatch.setattr(run_review, "_fetch_pr_diff", lambda repo, pr_number, token: "full diff")
+
+    diff = _fetch_review_diff(
+        "owner/repo",
+        "12",
+        "token",
+        ReviewCommand(scope="bulk_range", count=0, head_sha="head"),
+    )
+
+    assert diff == "full diff"
+
+
+def test_bulk_range_invalid_state_falls_back_to_full_pr(monkeypatch):
+    monkeypatch.setattr(
+        run_review,
+        "_fetch_pr_metadata",
+        lambda repo, pr_number, token: {"head": {"sha": "head", "repo": {"full_name": "fork/repo"}}},
+    )
+    monkeypatch.setattr(
+        run_review,
+        "_read_review_state",
+        lambda repo, pr_number, token: ReviewState(
+            comment_id=99,
+            last_reviewed_sha="missing",
+            updated_at="2026-04-30T00:00:00+00:00",
+        ),
+    )
+
+    def fake_fetch_compare_diff(repo, start_sha, head_sha, token):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(run_review, "_fetch_compare_diff", fake_fetch_compare_diff)
+    monkeypatch.setattr(run_review, "_fetch_pr_diff", lambda repo, pr_number, token: "full diff")
+
+    diff = _fetch_review_diff(
+        "owner/repo",
+        "12",
+        "token",
+        ReviewCommand(scope="bulk_range", count=0, head_sha="head"),
+    )
+
+    assert diff == "full diff"
+
+
+def test_bulk_range_invalid_state_logs_compare_exit_code(monkeypatch, capsys):
+    monkeypatch.setattr(
+        run_review,
+        "_fetch_pr_metadata",
+        lambda repo, pr_number, token: {"head": {"sha": "head", "repo": {"full_name": "fork/repo"}}},
+    )
+    monkeypatch.setattr(
+        run_review,
+        "_read_review_state",
+        lambda repo, pr_number, token: ReviewState(
+            comment_id=99,
+            last_reviewed_sha="missing",
+            updated_at="2026-04-30T00:00:00+00:00",
+        ),
+    )
+    monkeypatch.setattr(run_review, "_fetch_compare_diff", lambda repo, start_sha, head_sha, token: (_ for _ in ()).throw(SystemExit(22)))
+    monkeypatch.setattr(run_review, "_fetch_pr_diff", lambda repo, pr_number, token: "full diff")
+
+    diff = _fetch_review_diff(
+        "owner/repo",
+        "12",
+        "token",
+        ReviewCommand(scope="bulk_range", count=0, head_sha="head"),
+    )
+
+    captured = capsys.readouterr()
+    assert diff == "full diff"
+    assert "exited with 22" in captured.out
+
+
+def test_main_advances_state_after_successful_posted_review(tmp_path, monkeypatch):
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"action": "opened", "pull_request": {"number": 12, "head": {"sha": "head-success"}}}),
+        encoding="utf-8",
+    )
+    written = {}
+
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("INPUT_TRIGGER", "bulk_commit")
+    monkeypatch.setenv("INPUT_POST_COMMENTS", "true")
+    monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setattr(run_review, "_fetch_review_diff", lambda repo, pr_number, token, command: SAMPLE_DIFF)
+    monkeypatch.setattr(
+        run_review,
+        "_write_review_state",
+        lambda repo, pr_number, token, head_sha: written.setdefault("head_sha", head_sha),
+    )
+    monkeypatch.setattr(
+        run_review.subprocess,
+        "run",
+        lambda cmd, capture_output, text: SimpleNamespace(returncode=0),
+    )
+
+    assert run_review.main() == 0
+    assert written["head_sha"] == "head-success"
+
+
+def test_main_does_not_advance_state_when_review_fails(tmp_path, monkeypatch):
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"action": "opened", "pull_request": {"number": 12, "head": {"sha": "head-fail"}}}),
+        encoding="utf-8",
+    )
+    written = {}
+
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("INPUT_TRIGGER", "bulk_commit")
+    monkeypatch.setenv("INPUT_POST_COMMENTS", "true")
+    monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setattr(run_review, "_fetch_review_diff", lambda repo, pr_number, token, command: SAMPLE_DIFF)
+    monkeypatch.setattr(
+        run_review,
+        "_write_review_state",
+        lambda repo, pr_number, token, head_sha: written.setdefault("head_sha", head_sha),
+    )
+    monkeypatch.setattr(
+        run_review.subprocess,
+        "run",
+        lambda cmd, capture_output, text: SimpleNamespace(returncode=1),
+    )
+
+    assert run_review.main() == 1
+    assert written == {}
+
+
+def test_main_reports_state_update_failure(tmp_path, monkeypatch, capsys):
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"action": "opened", "pull_request": {"number": 12, "head": {"sha": "head-fail"}}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("INPUT_TRIGGER", "bulk_commit")
+    monkeypatch.setenv("INPUT_POST_COMMENTS", "true")
+    monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setattr(run_review, "_fetch_review_diff", lambda repo, pr_number, token, command: SAMPLE_DIFF)
+    monkeypatch.setattr(run_review, "_write_review_state", lambda repo, pr_number, token, head_sha: (_ for _ in ()).throw(SystemExit(22)))
+    monkeypatch.setattr(
+        run_review.subprocess,
+        "run",
+        lambda cmd, capture_output, text: SimpleNamespace(returncode=0),
+    )
+
+    assert run_review.main() == 22
+    captured = capsys.readouterr()
+    assert "failed to persist last reviewed SHA" in captured.err

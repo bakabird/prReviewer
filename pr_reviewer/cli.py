@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 _CONFIGURABLE_REVIEW_OPTIONS = {
     "model",
+    "models",
     "mode",
     "max_lines",
     "format",
@@ -68,6 +69,7 @@ class ConfigError(RuntimeError):
 def _default_review_options() -> dict[str, object]:
     return {
         "model": os.getenv("PR_REVIEWER_MODEL", "gpt-4.1-mini"),
+        "models": "",
         "mode": "single",
         "max_lines": 1200,
         "format": "text",
@@ -164,6 +166,11 @@ def build_parser(*, review_defaults: dict[str, object] | None = None) -> argpars
         "--model",
         default=defaults["model"],
         help="LLM model identifier sent to the provider",
+    )
+    review_parser.add_argument(
+        "--models",
+        default=defaults["models"],
+        help="Ordered comma-separated LLM model identifiers. Takes precedence over --model when set.",
     )
     review_parser.add_argument(
         "--mode",
@@ -331,9 +338,10 @@ def run_review(args: argparse.Namespace) -> int:
     try:
         provider = OpenAICompatibleProvider(base_url=args.base_url)
         reviewer = PRReviewer(provider)
-        result = reviewer.review(
+        models = _parse_models_arg(args.models, fallback_model=args.model)
+        result = reviewer.review_many(
             diff_text=diff_text,
-            model=args.model,
+            models=models,
             max_lines=args.max_lines,
             review_mode=args.mode,
             file_context=file_context,
@@ -469,6 +477,11 @@ def _validate_post_args(args: argparse.Namespace) -> str | None:
         return "--post gitlab does not accept --pr"
 
     return None
+
+
+def _parse_models_arg(models: str, *, fallback_model: str) -> list[str]:
+    parsed = [model.strip() for model in models.split(",") if model.strip()]
+    return parsed or [fallback_model]
 
 
 def _resolve_github_head_sha(

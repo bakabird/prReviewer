@@ -1,0 +1,51 @@
+name: AI PR Review Command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  id-token: write
+
+concurrency:
+  group: ai-pr-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  REVIEWER_BOT_NAME: momo
+
+jobs:
+  review:
+    if: >-
+      ${{
+        github.event.issue.pull_request &&
+        contains(
+          fromJson('["OWNER","MEMBER","COLLABORATOR"]'),
+          github.event.comment.author_association
+        )
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      # - name: Connect to Tailscale
+      #   uses: tailscale/github-action@v4
+      #   with:
+      #     oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      #     oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+      #     tags: tag:ci
+
+      - uses: bakabird/prReviewer@main
+        with:
+          api_key: ${{ secrets.LLM_API_KEY }}
+          github_token: ${{ github.token }}
+          trigger: comment
+          reviewer_bot_name: ${{ env.REVIEWER_BOT_NAME }}
+          model: ${{ secrets.LLM_MODEL }}
+          # Optional: comma-separated models run sequentially and override model when set.
+          # models: ${{ secrets.LLM_MODELS }}
+          base_url: ${{ secrets.LLM_BASE_URL }}
+          mode: multi
+          max_lines: "1200"
+          exclude: "*.lock,dist/**,node_modules/**"

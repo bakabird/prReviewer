@@ -134,6 +134,10 @@ _VERDICT_RANK = {
     Verdict.needs_attention: 2,
     Verdict.high_risk: 3,
 }
+_DUPLICATE_SAME_LOCATION_TITLE_THRESHOLD = 0.55
+_DUPLICATE_TITLE_THRESHOLD = 0.84
+_DUPLICATE_TITLE_WITH_EXPLANATION_THRESHOLD = 0.70
+_DUPLICATE_EXPLANATION_THRESHOLD = 0.72
 
 
 class PRReviewer:
@@ -189,6 +193,43 @@ class PRReviewer:
             file_context=file_context,
             project_context=project_context,
         )
+
+    def review_many(
+        self,
+        *,
+        diff_text: str,
+        models: list[str],
+        max_lines: int = 1200,
+        review_mode: str = "single",
+        file_context: dict[str, str] | None = None,
+        project_context: dict[str, str] | None = None,
+    ) -> ReviewResult:
+        configured_models = [model for model in models if model]
+        if not configured_models:
+            raise ValueError("at least one model is required")
+        if len(configured_models) == 1:
+            return self.review(
+                diff_text=diff_text,
+                model=configured_models[0],
+                max_lines=max_lines,
+                review_mode=review_mode,
+                file_context=file_context,
+                project_context=project_context,
+            )
+
+        results: list[ReviewResult] = []
+        for model in configured_models:
+            result = self.review(
+                diff_text=diff_text,
+                model=model,
+                max_lines=max_lines,
+                review_mode=review_mode,
+                file_context=file_context,
+                project_context=project_context,
+            )
+            _raise_if_model_review_failed(result)
+            results.append(result)
+        return aggregate_review_results(results, models=configured_models)
 
     def _review_single(
         self,
@@ -809,6 +850,85 @@ def _dedupe_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
     return merged
 
 
+def aggregate_review_results(results: list[ReviewResult], *, models: list[str]) -> ReviewResult:
+    if not results:
+        raise ValueError("at least one review result is required")
+    _validate_aggregate_metadata(results)
+
+    all_findings: list[ReviewFinding] = []
+    warnings: list[str] = []
+    pass_names: list[str] = []
+    verdicts: list[Verdict] = []
+    for result in results:
+        all_findings.extend(result.findings)
+        warnings.extend(result.warnings)
+        pass_names.extend(result.passes_run)
+        verdicts.append(result.verdict)
+
+    merged_findings = _sort_findings(_dedupe_findings(all_findings))
+    deduped_count = len(all_findings) - len(merged_findings)
+    if deduped_count > 0:
+        warnings.append(f"Deduped {deduped_count} overlapping finding(s) across configured models.")
+
+    verdict = _infer_verdict(merged_findings, verdicts)
+    model_label = f"aggregate({','.join(models)})"
+    summary = _build_aggregate_summary(models=models, findings=merged_findings, verdict=verdict)
+    base = results[0]
+    return ReviewResult(
+        summary=summary,
+        verdict=verdict,
+        findings=merged_findings,
+        model=model_label,
+        diff=base.diff,
+        review_mode=base.review_mode,
+        passes_run=_unique_strings(pass_names),
+        warnings=warnings,
+    )
+
+
+def _validate_aggregate_metadata(results: list[ReviewResult]) -> None:
+    base = results[0]
+    for result in results[1:]:
+        if result.review_mode != base.review_mode:
+            raise ValueError("cannot aggregate review results from different review modes")
+        if result.diff != base.diff:
+            raise ValueError("cannot aggregate review results from different diffs")
+
+
+def _raise_if_model_review_failed(result: ReviewResult) -> None:
+    if result.raw_response:
+        raise LLMError(f"Review generation failed for configured model {result.model}.")
+    llm_warnings = [warning for warning in result.warnings if "LLM call failed" in warning]
+    if llm_warnings:
+        raise LLMError(f"Review generation failed for configured model {result.model}: {llm_warnings[0]}")
+
+
+def _build_aggregate_summary(*, models: list[str], findings: list[ReviewFinding], verdict: Verdict) -> str:
+    model_list = ", ".join(models)
+    if not findings:
+        return f"Multi-model review across {model_list} found no material issues in the visible diff."
+
+    high = sum(1 for finding in findings if finding.severity == Severity.high)
+    medium = sum(1 for finding in findings if finding.severity == Severity.medium)
+    low = sum(1 for finding in findings if finding.severity == Severity.low)
+    top_titles = "; ".join(finding.title for finding in findings[:3])
+    return (
+        f"Multi-model review across {model_list} produced a {verdict.value} verdict with "
+        f"{len(findings)} unique findings (high: {high}, medium: {medium}, low: {low}). "
+        f"Top risks: {top_titles}."
+    )
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value not in seen:
+            unique.append(value)
+            seen.add(value)
+    return unique
+
+
 def _is_duplicate(left: ReviewFinding, right: ReviewFinding) -> bool:
     if left.category != right.category:
         return False
@@ -827,10 +947,13 @@ def _is_duplicate(left: ReviewFinding, right: ReviewFinding) -> bool:
         _normalize_text(right.explanation),
     )
 
-    if left_file and right_file and left.line and right.line and title_ratio >= 0.55:
+    if left_file and right_file and left.line and right.line and title_ratio >= _DUPLICATE_SAME_LOCATION_TITLE_THRESHOLD:
         return True
 
-    return title_ratio >= 0.84 or (title_ratio >= 0.70 and explanation_ratio >= 0.72)
+    return title_ratio >= _DUPLICATE_TITLE_THRESHOLD or (
+        title_ratio >= _DUPLICATE_TITLE_WITH_EXPLANATION_THRESHOLD
+        and explanation_ratio >= _DUPLICATE_EXPLANATION_THRESHOLD
+    )
 
 
 def _merge_finding(target: ReviewFinding, candidate: ReviewFinding) -> None:
@@ -846,6 +969,12 @@ def _merge_finding(target: ReviewFinding, candidate: ReviewFinding) -> None:
 
     if (not target.suggested_fix) and candidate.suggested_fix:
         target.suggested_fix = candidate.suggested_fix
+    elif (
+        target.suggested_fix
+        and candidate.suggested_fix
+        and candidate.suggested_fix not in target.suggested_fix
+    ):
+        target.suggested_fix = f"{target.suggested_fix}\n\nAlternative: {candidate.suggested_fix}"
 
     if len(candidate.explanation) > len(target.explanation):
         target.explanation = candidate.explanation

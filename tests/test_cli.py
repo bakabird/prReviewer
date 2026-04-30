@@ -45,7 +45,7 @@ def _install_fake_review_flow(monkeypatch: pytest.MonkeyPatch) -> dict[str, obje
         def __init__(self, provider: object) -> None:
             calls["provider"] = provider
 
-        def review(self, **kwargs: object) -> ReviewResult:
+        def review_many(self, **kwargs: object) -> ReviewResult:
             calls["review_kwargs"] = kwargs
             return _sample_result()
 
@@ -140,7 +140,7 @@ def test_main_reads_patch_and_saves_output(
     assert output_path.read_text(encoding="utf-8") == "formatted review\n"
     assert calls["review_kwargs"] == {
         "diff_text": SAMPLE_DIFF,
-        "model": "gpt-4.1-mini",
+        "models": ["gpt-4.1-mini"],
         "max_lines": 1200,
         "review_mode": "single",
         "file_context": None,
@@ -216,7 +216,7 @@ def test_main_loads_defaults_from_dot_pr_reviewer_toml(
     assert calls["provider"] == {"base_url": "https://config.example/v1"}
     assert calls["review_kwargs"] == {
         "diff_text": SAMPLE_DIFF,
-        "model": "config-model",
+        "models": ["config-model"],
         "max_lines": 77,
         "review_mode": "multi",
         "file_context": None,
@@ -275,7 +275,7 @@ def test_main_loads_pyproject_config_but_cli_flags_override(
     assert calls["provider"] == {"base_url": "https://pyproject.example/v1"}
     assert calls["review_kwargs"] == {
         "diff_text": SAMPLE_DIFF,
-        "model": "cli-model",
+        "models": ["cli-model"],
         "max_lines": 88,
         "review_mode": "single",
         "file_context": None,
@@ -286,6 +286,23 @@ def test_main_loads_pyproject_config_but_cli_flags_override(
         "compact": False,
         "color": False,
     }
+
+
+def test_main_parses_ordered_models_input(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    patch_path = tmp_path / "sample.patch"
+    patch_path.write_text(SAMPLE_DIFF, encoding="utf-8")
+    calls = _install_fake_review_flow(monkeypatch)
+
+    exit_code = cli.main(["review", str(patch_path), "--model", "fallback", "--models", "a, b"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out.strip() == "formatted review"
+    assert calls["review_kwargs"]["models"] == ["a", "b"]
 
 
 def test_main_reports_invalid_config(
