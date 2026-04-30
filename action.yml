@@ -34,6 +34,18 @@ inputs:
     description: 'Max diff lines per review chunk'
     required: false
     default: '1200'
+  timeout_seconds:
+    description: 'Per-request timeout in seconds for provider chat completions'
+    required: false
+    default: '120'
+  max_retries:
+    description: 'Max retry attempts for transient provider request failures'
+    required: false
+    default: '10'
+  max_tokens:
+    description: 'Optional cap for completion tokens sent to the provider'
+    required: false
+    default: ''
   exclude:
     description: 'Glob patterns to exclude from review (comma-separated, e.g. "*.lock,docs/**")'
     required: false
@@ -73,6 +85,9 @@ runs:
       env:
         PR_REVIEWER_API_KEY: ${{ inputs.api_key }}
         PR_REVIEWER_BASE_URL: ${{ inputs.base_url }}
+        PR_REVIEWER_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+        PR_REVIEWER_MAX_RETRIES: ${{ inputs.max_retries }}
+        PR_REVIEWER_MAX_TOKENS: ${{ inputs.max_tokens }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_MODELS: ${{ inputs.models }}

@@ -32,6 +32,8 @@ jobs:
           trigger: bulk_commit
           mode: multi
           max_lines: '1200'
+          timeout_seconds: '120'
+          max_retries: '10'
           exclude: '*.lock,dist/**,node_modules/**'
 ```
 
@@ -43,9 +45,11 @@ If the hidden state marker comment is deleted or contains a SHA that can no long
 
 Short-window commit batching is not implemented. Each `synchronize` event is eligible for review according to the stored last reviewed SHA.
 
-`mode: multi` runs separate correctness, security, and performance passes before merging the findings. `max_lines: '1200'` is the approximate diff-line budget per LLM request; lower it to make smaller requests, or raise it to reduce chunking for large diffs.
+`mode: multi` runs separate correctness, security, and performance passes before merging the findings. `max_lines: '1200'` is the approximate diff-line budget per LLM request; lower it to make smaller requests, or raise it to reduce chunking for large diffs. For self-hosted or proxied providers, also tune `timeout_seconds`, `max_retries`, and optionally `max_tokens` so failed requests do not stall the workflow for too long or overrun a fragile proxy.
 
 3. Open a pull request. That's it.
+
+If `GET /v1/models` works but reviews still hang, add a small probe step before `bakabird/prReviewer` to verify `POST /v1/chat/completions` against a real model. The full step is documented in [docs/github-action-setup.md](docs/github-action-setup.md).
 
 ## Trigger reviews from PR comments
 
@@ -156,6 +160,9 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
     models: ''                 # optional comma-separated ordered models; overrides model when set
     base_url: 'https://api.openai.com/v1'  # or any compatible provider
     max_lines: '1200'          # diff chunk budget per LLM call
+    timeout_seconds: '120'     # provider chat completion timeout per request
+    max_retries: '10'          # provider request retry budget
+    max_tokens: ''             # optional completion cap; useful for fragile/self-hosted providers
     exclude: '*.lock,docs/**'  # glob patterns to skip (comma-separated)
     post_comments: 'true'      # set to 'false' to just print the review without posting
 ```
@@ -171,6 +178,9 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
 | `mode` | No | `multi` | `single` (fast) or `multi` (deep, multi-pass) |
 | `base_url` | No | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
 | `max_lines` | No | `1200` | Max diff lines per review chunk |
+| `timeout_seconds` | No | `120` | Per-request timeout in seconds for provider chat completions |
+| `max_retries` | No | `10` | Retry attempts for transient provider failures |
+| `max_tokens` | No | — | Optional completion-token cap sent to the provider |
 | `exclude` | No | — | Comma-separated glob patterns to skip |
 | `post_comments` | No | `true` | Whether to post inline PR comments |
 | `trigger` | No | `bulk_commit` | `bulk_commit` or `comment` |
@@ -188,7 +198,7 @@ Default mode is **`multi`**, which runs separate passes for correctness, securit
 7. Aggregates all configured model results into one final review
 8. Posts findings as inline review comments on the changed lines
 
-The removed `trigger: auto` and `trigger: pull_request` modes are rejected. `models` is all-or-nothing: if any configured model fails, the action fails, stops before posting comments, and does not advance the hidden last-reviewed SHA. Multiple models multiply latency and provider cost.
+The removed `trigger: auto` and `trigger: pull_request` modes are rejected. `models` is all-or-nothing: if any configured model fails, the action fails, stops before posting comments, and does not advance the hidden last-reviewed SHA. Multiple models multiply latency and provider cost. If your provider sits behind Tailscale or another proxy, tune `timeout_seconds`, `max_retries`, `max_tokens`, `mode`, and `max_lines` together to avoid very long failed runs.
 
 ## CLI usage
 

@@ -896,11 +896,11 @@ def _validate_aggregate_metadata(results: list[ReviewResult]) -> None:
 
 
 def _raise_if_model_review_failed(result: ReviewResult) -> None:
-    if result.raw_response:
-        raise LLMError(f"Review generation failed for configured model {result.model}.")
     llm_warnings = [warning for warning in result.warnings if "LLM call failed" in warning]
     if llm_warnings:
         raise LLMError(f"Review generation failed for configured model {result.model}: {llm_warnings[0]}")
+    if result.raw_response:
+        raise LLMError(f"Review generation failed for configured model {result.model}.")
 
 
 def _build_aggregate_summary(*, models: list[str], findings: list[ReviewFinding], verdict: Verdict) -> str:

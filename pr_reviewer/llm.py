@@ -37,8 +37,9 @@ class LLMProvider(Protocol):
 class OpenAICompatibleProvider:
     api_key: str | None = None
     base_url: str | None = None
-    timeout_seconds: int = 120
-    max_retries: int = 10
+    timeout_seconds: int | None = None
+    max_retries: int | None = None
+    max_tokens: int | None = None
 
     def __post_init__(self) -> None:
         self.api_key = self.api_key or os.getenv("PR_REVIEWER_API_KEY") or os.getenv("OPENAI_API_KEY")
@@ -54,6 +55,20 @@ class OpenAICompatibleProvider:
             or os.getenv("OPENAI_BASE_URL")
             or default_base_url
         ).rstrip("/")
+        self.timeout_seconds = _resolve_positive_int(
+            value=self.timeout_seconds,
+            env_name="PR_REVIEWER_TIMEOUT_SECONDS",
+            default=120,
+        )
+        self.max_retries = _resolve_positive_int(
+            value=self.max_retries,
+            env_name="PR_REVIEWER_MAX_RETRIES",
+            default=10,
+        )
+        self.max_tokens = _resolve_optional_positive_int(
+            value=self.max_tokens,
+            env_name="PR_REVIEWER_MAX_TOKENS",
+        )
 
     def complete_json(
         self,
@@ -87,6 +102,8 @@ class OpenAICompatibleProvider:
                 {"role": "user", "content": user_prompt},
             ],
         }
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -98,7 +115,8 @@ class OpenAICompatibleProvider:
         base_delay = 0.35
         max_delay = 8.0
 
-        for attempt in range(1, attempts + 1):
+        attempt = 1
+        while attempt <= attempts:
             t0 = time.monotonic()
             try:
                 response = requests.post(
@@ -115,6 +133,7 @@ class OpenAICompatibleProvider:
                     delay = min(max_delay, base_delay * (2 ** (attempt - 1))) + random.uniform(0, 1)
                     logger.warning("LLM request error (attempt %d/%d): %s — retrying in %.1fs", attempt, attempts, exc, delay)
                     time.sleep(delay)
+                    attempt += 1
                     continue
 
                 raise LLMError(
@@ -152,6 +171,7 @@ class OpenAICompatibleProvider:
                     delay,
                 )
                 time.sleep(delay)
+                attempt += 1
                 continue
             break
 
@@ -188,3 +208,38 @@ class OpenAICompatibleProvider:
             raise LLMError("LLM response did not contain text content.")
 
         return content
+
+
+def _resolve_positive_int(*, value: int | None, env_name: str, default: int) -> int:
+    if value is not None:
+        resolved = value
+    else:
+        raw = os.getenv(env_name)
+        if raw is None or not raw.strip():
+            resolved = default
+        else:
+            try:
+                resolved = int(raw)
+            except ValueError as exc:
+                raise ProviderConfigError(f"{env_name} must be an integer, got {raw!r}.") from exc
+
+    if resolved <= 0:
+        raise ProviderConfigError(f"{env_name} must be greater than 0, got {resolved}.")
+    return resolved
+
+
+def _resolve_optional_positive_int(*, value: int | None, env_name: str) -> int | None:
+    if value is not None:
+        resolved = value
+    else:
+        raw = os.getenv(env_name)
+        if raw is None or not raw.strip():
+            return None
+        try:
+            resolved = int(raw)
+        except ValueError as exc:
+            raise ProviderConfigError(f"{env_name} must be an integer, got {raw!r}.") from exc
+
+    if resolved <= 0:
+        raise ProviderConfigError(f"{env_name} must be greater than 0, got {resolved}.")
+    return resolved

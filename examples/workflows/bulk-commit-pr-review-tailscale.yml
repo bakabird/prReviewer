@@ -25,6 +25,73 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
+      - name: Probe chat completions
+        shell: bash
+        env:
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_PROBE_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_MODELS: ${{ secrets.LLM_MODELS }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          base_url = os.environ["LLM_BASE_URL"].rstrip("/")
+          configured_models = [
+              model.strip()
+              for model in os.environ.get("LLM_MODELS", "").split(",")
+              if model.strip()
+          ]
+          model = configured_models[0] if configured_models else os.environ["LLM_PROBE_MODEL"]
+          payload = {
+              "model": model,
+              "messages": [{"role": "user", "content": "Reply with exactly OK"}],
+              "temperature": 0,
+              "max_tokens": 5,
+              "stream": False,
+          }
+          request = urllib.request.Request(
+              f"{base_url}/chat/completions",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {os.environ['LLM_API_KEY']}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  body = response.read().decode("utf-8", errors="replace")
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace")
+              print(f"chat/completions probe failed with HTTP {exc.code}", file=sys.stderr)
+              print(detail[:4000], file=sys.stderr)
+              raise
+          except Exception as exc:
+              print(f"chat/completions probe failed: {exc}", file=sys.stderr)
+              raise
+
+          try:
+              data = json.loads(body)
+          except json.JSONDecodeError as exc:
+              print("chat/completions probe returned non-JSON response", file=sys.stderr)
+              print(body[:4000], file=sys.stderr)
+              raise SystemExit(1) from exc
+
+          message = data.get("choices", [{}])[0].get("message", {}).get("content")
+          if not message:
+              print("chat/completions probe succeeded but response had no message content", file=sys.stderr)
+              print(body[:4000], file=sys.stderr)
+              raise SystemExit(1)
+
+          print(f"chat/completions probe ok for model {model}: {message!r}")
+          PY
+
       - uses: bakabird/prReviewer@main
         with:
           api_key: ${{ secrets.LLM_API_KEY }}
@@ -36,4 +103,7 @@ jobs:
           base_url: ${{ secrets.LLM_BASE_URL }}
           mode: multi
           max_lines: "1200"
+          timeout_seconds: "120"
+          max_retries: "10"
+          max_tokens: "1200"
           exclude: "*.lock,dist/**,node_modules/**"

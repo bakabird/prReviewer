@@ -28,4 +28,6 @@ jobs:
           base_url: ${{ secrets.LLM_BASE_URL }}
           mode: multi
           max_lines: "1200"
+          timeout_seconds: "120"
+          max_retries: "10"
           exclude: "*.lock,dist/**,node_modules/**"

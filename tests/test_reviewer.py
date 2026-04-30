@@ -531,8 +531,49 @@ def test_review_many_model_failure_blocks_aggregation() -> None:
 def test_review_many_handled_llm_failure_blocks_aggregation() -> None:
     reviewer = PRReviewer(FailingProvider("Request timed out"))
 
-    with pytest.raises(LLMError):
+    with pytest.raises(LLMError, match="Request timed out"):
         reviewer.review_many(diff_text=SAMPLE_DIFF, models=["bad", "other"], review_mode="single")
+
+
+def test_multi_pass_continues_after_initial_provider_failure() -> None:
+    class RecoveringProvider:
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        def complete_json(self, *, model, system_prompt, user_prompt, json_schema=None):
+            self.call_count += 1
+            if self.call_count == 1:
+                raise LLMError("temporary outage")
+            if self.call_count == 2:
+                return json.dumps({
+                    "summary": "Security found an issue.",
+                    "verdict": "needs attention",
+                    "findings": [{
+                        "severity": "medium",
+                        "category": "security",
+                        "title": "Sensitive path remains reachable",
+                        "explanation": "Later passes should still run after the provider recovers.",
+                        "file": "app/main.py",
+                        "line": 2,
+                        "confidence": 0.80,
+                    }],
+                })
+            return json.dumps({
+                "summary": "No further issues.",
+                "verdict": "looks good",
+                "findings": [],
+            })
+
+    provider = RecoveringProvider()
+    reviewer = PRReviewer(provider)
+
+    result = reviewer.review(diff_text=SAMPLE_DIFF, model="fake", review_mode="multi")
+
+    assert provider.call_count == 3
+    assert "security" in result.passes_run
+    assert "performance" in result.passes_run
+    assert any("LLM call failed: temporary outage" in warning for warning in result.warnings)
+    assert any(finding.title == "Sensitive path remains reachable" for finding in result.findings)
 
 
 def test_aggregate_review_results_dedupes_and_selects_highest_risk_verdict() -> None:
