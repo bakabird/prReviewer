@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from pr_reviewer.llm import OpenAICompatibleProvider
+from pr_reviewer.llm import LLMError, OpenAICompatibleProvider
 
 SIMPLE_SCHEMA = {
     "type": "object",
@@ -110,6 +110,25 @@ def test_graceful_fallback_on_400() -> None:
     # Second call should have fallen back to json_object
     assert captured_payloads[1]["response_format"] == {"type": "json_object"}
     assert captured_payloads[1]["stream"] is False
+
+
+def test_default_request_errors_retry_ten_times() -> None:
+    with (
+        patch("pr_reviewer.llm.requests.post", side_effect=requests.Timeout("timeout")) as mock_post,
+        patch("pr_reviewer.llm.random.uniform", return_value=0),
+        patch("pr_reviewer.llm.time.sleep") as mock_sleep,
+    ):
+        provider = OpenAICompatibleProvider(api_key="test-key")
+
+        with pytest.raises(LLMError, match="after 10 attempts"):
+            provider.complete_json(
+                model="gpt-4",
+                system_prompt="You are a reviewer.",
+                user_prompt="Review this.",
+            )
+
+    assert mock_post.call_count == 10
+    assert mock_sleep.call_count == 9
 
 
 def test_live_openai_compatible_provider_non_streaming_json_response() -> None:

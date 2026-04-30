@@ -38,7 +38,7 @@ class OpenAICompatibleProvider:
     api_key: str | None = None
     base_url: str | None = None
     timeout_seconds: int = 120
-    max_retries: int = 3
+    max_retries: int = 10
 
     def __post_init__(self) -> None:
         self.api_key = self.api_key or os.getenv("PR_REVIEWER_API_KEY") or os.getenv("OPENAI_API_KEY")
