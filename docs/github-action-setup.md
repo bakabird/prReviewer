@@ -96,7 +96,7 @@ Use `models` to run more than one configured model against the same selected dif
     models: 'gpt-4.1-mini,gpt-4.1'
 ```
 
-`models` takes precedence over `model`. When `models` is empty, the action falls back to `model`. Models run sequentially in the configured order, and the action posts one aggregated result after all models complete. If any configured model fails, the whole review fails before posting and before advancing the hidden last-reviewed SHA. Multiple models multiply latency and provider cost, so tune `models`, `mode`, `exclude`, and `max_lines` together.
+`models` takes precedence over `model`. When `models` is empty, the action falls back to `model`. Models run sequentially in the configured order, and the action posts one aggregated result after all models complete. If any configured model fails, the review stops before posting and before advancing the hidden last-reviewed SHA. By default, that failure is emitted as a workflow warning; set `fail_on_error: 'true'` when review generation should fail CI. Multiple models multiply latency and provider cost, so tune `models`, `mode`, `exclude`, and `max_lines` together.
 
 ## Using a different LLM provider
 

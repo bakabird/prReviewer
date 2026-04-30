@@ -700,6 +700,37 @@ def test_main_does_not_advance_state_when_review_fails(tmp_path, monkeypatch):
         lambda cmd, capture_output, text: SimpleNamespace(returncode=1),
     )
 
+    assert run_review.main() == 0
+    assert written == {}
+
+
+def test_main_can_fail_workflow_when_review_fails(tmp_path, monkeypatch):
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"action": "opened", "pull_request": {"number": 12, "head": {"sha": "head-fail"}}}),
+        encoding="utf-8",
+    )
+    written = {}
+
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("INPUT_TRIGGER", "bulk_commit")
+    monkeypatch.setenv("INPUT_POST_COMMENTS", "true")
+    monkeypatch.setenv("INPUT_FAIL_ON_ERROR", "true")
+    monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setattr(run_review, "_fetch_review_diff", lambda repo, pr_number, token, command: SAMPLE_DIFF)
+    monkeypatch.setattr(
+        run_review,
+        "_write_review_state",
+        lambda repo, pr_number, token, head_sha: written.setdefault("head_sha", head_sha),
+    )
+    monkeypatch.setattr(
+        run_review.subprocess,
+        "run",
+        lambda cmd, capture_output, text: SimpleNamespace(returncode=1),
+    )
+
     assert run_review.main() == 1
     assert written == {}
 

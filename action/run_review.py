@@ -49,6 +49,7 @@ def main() -> int:
     max_lines = os.environ.get("INPUT_MAX_LINES", "1200")
     exclude = os.environ.get("INPUT_EXCLUDE", "")
     post_comments = os.environ.get("INPUT_POST_COMMENTS", "true").lower() == "true"
+    fail_on_error = os.environ.get("INPUT_FAIL_ON_ERROR", "false").lower() == "true"
 
     review_request = _resolve_review_request(
         trigger=trigger,
@@ -134,7 +135,7 @@ def main() -> int:
 
     if result.returncode != 0:
         print(f"::warning::Review exited with code {result.returncode}")
-        return result.returncode
+        return result.returncode if fail_on_error else 0
 
     if post_comments and command.update_state and command.head_sha:
         try:
