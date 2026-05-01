@@ -10,7 +10,9 @@ from action import run_review
 from action.run_review import (
     ReviewCommand,
     ReviewState,
+    _build_gate_state,
     _extract_state_from_comment,
+    _fetch_pr_head_sha,
     _fetch_review_diff,
     _filter_diff,
     _format_state_comment,
@@ -147,6 +149,8 @@ def test_comment_review_request_skips_regular_issue_comment(capsys):
         event_name="issue_comment",
         event=event,
         pr_number="12",
+        input_pr_number=None,
+        expected_head_sha=None,
         reviewer_bot_name="reviewer001",
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
@@ -167,6 +171,8 @@ def test_comment_review_request_skips_unauthorized_author(capsys):
         event_name="issue_comment",
         event=event,
         pr_number="12",
+        input_pr_number=None,
+        expected_head_sha=None,
         reviewer_bot_name="reviewer001",
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
@@ -187,6 +193,8 @@ def test_comment_review_request_returns_command_for_pr_comment():
         event_name="issue_comment",
         event=event,
         pr_number="12",
+        input_pr_number=None,
+        expected_head_sha=None,
         reviewer_bot_name="reviewer001",
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
@@ -202,6 +210,8 @@ def test_comment_trigger_skips_non_issue_comment_event(capsys):
         event_name="pull_request",
         event=event,
         pr_number="12",
+        input_pr_number=None,
+        expected_head_sha=None,
         reviewer_bot_name="reviewer001",
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
@@ -219,6 +229,8 @@ def test_removed_trigger_modes_are_rejected(trigger):
             event_name="pull_request",
             event={"action": "opened", "pull_request": {"number": 12}},
             pr_number="12",
+            input_pr_number=None,
+            expected_head_sha=None,
             reviewer_bot_name="reviewer001",
             allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
         )
@@ -230,6 +242,8 @@ def test_bulk_commit_skips_comment_events(capsys):
         event_name="issue_comment",
         event={"issue": {"number": 12, "pull_request": {}}, "comment": {"body": "@reviewer001 full"}},
         pr_number="12",
+        input_pr_number=None,
+        expected_head_sha=None,
         reviewer_bot_name="reviewer001",
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
@@ -245,6 +259,8 @@ def test_bulk_commit_opened_routes_full_review():
         event_name="pull_request",
         event={"action": "opened", "pull_request": {"number": 12, "head": {"sha": "head1"}}},
         pr_number="12",
+        input_pr_number=None,
+        expected_head_sha=None,
         reviewer_bot_name="reviewer001",
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
@@ -258,6 +274,8 @@ def test_bulk_commit_synchronize_routes_range_review():
         event_name="pull_request",
         event={"action": "synchronize", "pull_request": {"number": 12, "head": {"sha": "head2"}}},
         pr_number="12",
+        input_pr_number=None,
+        expected_head_sha=None,
         reviewer_bot_name="reviewer001",
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
@@ -271,6 +289,8 @@ def test_bulk_commit_skips_unsupported_pull_request_actions(capsys):
         event_name="pull_request",
         event={"action": "closed", "pull_request": {"number": 12}},
         pr_number="12",
+        input_pr_number=None,
+        expected_head_sha=None,
         reviewer_bot_name="reviewer001",
         allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
     )
@@ -278,6 +298,78 @@ def test_bulk_commit_skips_unsupported_pull_request_actions(capsys):
     captured = capsys.readouterr()
     assert result is None
     assert "Unsupported pull_request action" in captured.out
+
+
+def test_full_pr_trigger_uses_workflow_dispatch_inputs():
+    result = _resolve_review_request(
+        trigger="full_pr",
+        event_name="workflow_dispatch",
+        event={},
+        pr_number=None,
+        input_pr_number="34",
+        expected_head_sha="abc123",
+        reviewer_bot_name="reviewer001",
+        allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
+    )
+
+    assert result == (
+        "34",
+        ReviewCommand(
+            scope="full",
+            count=0,
+            head_sha="abc123",
+            expected_head_sha="abc123",
+            update_state=True,
+            gate_relevant=True,
+        ),
+    )
+
+
+def test_full_pr_trigger_requires_pr_number():
+    with pytest.raises(SystemExit):
+        _resolve_review_request(
+            trigger="full_pr",
+            event_name="workflow_dispatch",
+            event={},
+            pr_number=None,
+            input_pr_number="",
+            expected_head_sha="abc123",
+            reviewer_bot_name="reviewer001",
+            allowed_author_associations="OWNER,MEMBER,COLLABORATOR",
+        )
+
+
+def test_fetch_pr_head_sha_reads_current_head(monkeypatch):
+    monkeypatch.setattr(
+        run_review,
+        "_fetch_pr_metadata",
+        lambda repo, pr_number, token: {"head": {"sha": "actual-head"}},
+    )
+
+    assert _fetch_pr_head_sha("owner/repo", "12", "token") == "actual-head"
+
+
+def test_gate_state_includes_counts_fallbacks_and_errors():
+    state = _build_gate_state(
+        {
+            "severity_counts": {"high": 1, "medium": 2, "low": 3, "unparseable": 1},
+            "fallback_findings": [{"severity": "high", "title": "Fallback"}],
+            "posting_errors": ["diagnostic"],
+        },
+        command=ReviewCommand(
+            scope="full",
+            count=0,
+            expected_head_sha="abc123",
+            gate_relevant=True,
+        ),
+    )
+
+    assert state["status"] == "completed"
+    assert state["source"] == "full_pr"
+    assert state["expected_head_sha"] == "abc123"
+    assert state["severity_counts"]["high"] == 1
+    assert state["fallback_findings"] == [{"severity": "high", "title": "Fallback"}]
+    assert state["errors"] == ["diagnostic"]
 
 
 def test_models_input_takes_precedence_over_model():
@@ -662,7 +754,7 @@ def test_main_advances_state_after_successful_posted_review(tmp_path, monkeypatc
     monkeypatch.setattr(
         run_review,
         "_write_review_state",
-        lambda repo, pr_number, token, head_sha: written.setdefault("head_sha", head_sha),
+        lambda repo, pr_number, token, head_sha, **kwargs: written.setdefault("head_sha", head_sha),
     )
     monkeypatch.setattr(
         run_review.subprocess,
@@ -692,7 +784,7 @@ def test_main_fails_and_does_not_advance_state_when_review_fails(tmp_path, monke
     monkeypatch.setattr(
         run_review,
         "_write_review_state",
-        lambda repo, pr_number, token, head_sha: written.setdefault("head_sha", head_sha),
+        lambda repo, pr_number, token, head_sha, **kwargs: written.setdefault("head_sha", head_sha),
     )
     monkeypatch.setattr(
         run_review.subprocess,
@@ -704,6 +796,32 @@ def test_main_fails_and_does_not_advance_state_when_review_fails(tmp_path, monke
     assert written == {}
     captured = capsys.readouterr()
     assert "Review exited with code 1" in captured.err
+
+
+def test_main_full_pr_expected_head_mismatch_stops_before_review(tmp_path, monkeypatch, capsys):
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps({}), encoding="utf-8")
+    called = {}
+
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("INPUT_TRIGGER", "full_pr")
+    monkeypatch.setenv("INPUT_PR_NUMBER", "12")
+    monkeypatch.setenv("INPUT_EXPECTED_HEAD_SHA", "expected")
+    monkeypatch.setenv("INPUT_POST_COMMENTS", "true")
+    monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setattr(run_review, "_fetch_pr_head_sha", lambda repo, pr_number, token: "actual")
+    monkeypatch.setattr(
+        run_review,
+        "_fetch_review_diff",
+        lambda repo, pr_number, token, command: called.setdefault("review", True) or SAMPLE_DIFF,
+    )
+
+    assert run_review.main() == 1
+    assert called == {}
+    captured = capsys.readouterr()
+    assert "Expected PR head SHA expected but found actual" in captured.err
 
 
 def test_main_reports_state_update_failure(tmp_path, monkeypatch, capsys):
@@ -720,7 +838,11 @@ def test_main_reports_state_update_failure(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PR_REVIEWER_API_KEY", "secret")
     monkeypatch.setenv("REPO", "owner/repo")
     monkeypatch.setattr(run_review, "_fetch_review_diff", lambda repo, pr_number, token, command: SAMPLE_DIFF)
-    monkeypatch.setattr(run_review, "_write_review_state", lambda repo, pr_number, token, head_sha: (_ for _ in ()).throw(SystemExit(22)))
+    monkeypatch.setattr(
+        run_review,
+        "_write_review_state",
+        lambda repo, pr_number, token, head_sha, **kwargs: (_ for _ in ()).throw(SystemExit(22)),
+    )
     monkeypatch.setattr(
         run_review.subprocess,
         "run",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -35,6 +36,7 @@ _CONFIGURABLE_REVIEW_OPTIONS = {
     "integration_token",
     "integration_base_url",
     "dry_run_post",
+    "report_json",
 }
 _CHOICE_VALIDATORS = {
     "mode": {"single", "multi"},
@@ -83,6 +85,7 @@ def _default_review_options() -> dict[str, object]:
         "integration_token": None,
         "integration_base_url": None,
         "dry_run_post": False,
+        "report_json": None,
     }
 
 
@@ -258,6 +261,11 @@ def build_parser(*, review_defaults: dict[str, object] | None = None) -> argpars
         default=False,
         help="Skip automatic file context fetching (fetched by default when --post github is used)",
     )
+    review_parser.add_argument(
+        "--report-json",
+        default=defaults["report_json"],
+        help="Write machine-readable review and posting metadata to this JSON file",
+    )
 
     return parser
 
@@ -373,11 +381,12 @@ def run_review(args: argparse.Namespace) -> int:
 
         print(f"Saved output to {output_path}", file=sys.stderr)
 
+    posting_report = None
     if args.post:
         from .integrations import IntegrationError, post_findings
 
         try:
-            report = post_findings(
+            posting_report = post_findings(
                 platform=args.post,
                 result=result,
                 diff_text=diff_text,
@@ -392,7 +401,14 @@ def run_review(args: argparse.Namespace) -> int:
             logger.error("%s", exc)
             return 1
 
-        _print_posting_report(report=report, dry_run=args.dry_run_post)
+        _print_posting_report(report=posting_report, dry_run=args.dry_run_post)
+
+    if args.report_json:
+        try:
+            _write_report_json(args.report_json, result=result, posting_report=posting_report)
+        except OSError as exc:
+            logger.error("could not save report JSON to %s: %s", args.report_json, exc)
+            return 1
 
     return 0
 
@@ -522,6 +538,35 @@ def _print_posting_report(*, report, dry_run: bool) -> None:
     )
     for error in report.errors[:8]:
         print(f"  - {error}", file=sys.stderr)
+
+
+def _write_report_json(path: str, *, result, posting_report) -> None:
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    findings = [finding.model_dump(mode="json") for finding in result.findings]
+    severity_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0, "unparseable": 0}
+    for finding in findings:
+        severity = str(finding.get("severity") or "unparseable").lower()
+        if severity not in severity_counts:
+            severity = "unparseable"
+        severity_counts[severity] += 1
+
+    payload = {
+        "version": 1,
+        "summary": result.summary,
+        "verdict": str(result.verdict),
+        "model": result.model,
+        "review_mode": result.review_mode,
+        "severity_counts": severity_counts,
+        "findings": findings,
+        "fallback_findings": [],
+        "posting_errors": [],
+    }
+    if posting_report is not None:
+        payload["fallback_findings"] = posting_report.fallback_findings
+        payload["posting_errors"] = posting_report.errors
+
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _extract_config_arg(argv: list[str]) -> str | None:

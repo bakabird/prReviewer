@@ -32,6 +32,7 @@ class PostingReport:
     skipped: int = 0
     fallback_posted: int = 0
     errors: list[str] = field(default_factory=list)
+    fallback_findings: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -164,13 +165,20 @@ def _post_to_github(
         )
         postable_with_status.append((finding, target, False))
 
-    # Post fallback summary for 422-rejected findings
+    # Upsert fallback summary for 422-rejected findings.
     fallback_findings = [(f, t) for f, t, had_422 in postable_with_status if had_422]
     if fallback_findings:
+        report.fallback_findings = [_serialize_fallback_finding(f, t) for f, t in fallback_findings]
         body = _build_fallback_summary_body(fallback_findings)
-        issues_url = f"{base_url.rstrip('/')}/repos/{repo}/issues/{pr_number}/comments"
-        fb_response = session.post(issues_url, json={"body": body}, timeout=_REQUEST_TIMEOUT)
-        if fb_response.status_code in {200, 201}:
+        fb_response = _upsert_github_issue_comment(
+            session=session,
+            base_url=base_url,
+            repo=repo,
+            issue_number=pr_number,
+            marker="<!-- pr-reviewer-fallback-summary -->",
+            body=body,
+        )
+        if fb_response and fb_response.status_code in {200, 201}:
             report.fallback_posted += len(fallback_findings)
             report.posted += len(fallback_findings)
             report.skipped -= len(fallback_findings)
@@ -385,7 +393,7 @@ def _build_gitlab_comment_payload(
 def _build_fallback_summary_body(
     findings_with_targets: list[tuple[ReviewFinding, CommentTarget]],
 ) -> str:
-    lines = ["## PR Review — Findings (could not post as inline comments)\n"]
+    lines = ["<!-- pr-reviewer-fallback-summary -->", "## PR Review - Findings (could not post as inline comments)\n"]
     lines.append(
         "The following findings could not be posted as inline comments"
         " (the diff position may have changed). They are summarized here instead.\n"
@@ -406,6 +414,43 @@ def _build_fallback_summary_body(
             lines.append(f"**Suggested fix**: {finding.suggested_fix}\n")
         lines.append("")
     return "\n".join(lines)
+
+
+def _serialize_fallback_finding(finding: ReviewFinding, target: CommentTarget) -> dict[str, object]:
+    return {
+        "severity": finding.severity.value,
+        "category": finding.category.value,
+        "title": finding.title,
+        "file": target.file_path,
+        "line": finding.line,
+        "confidence": finding.confidence,
+        "explanation": finding.explanation,
+        "suggested_fix": finding.suggested_fix,
+    }
+
+
+def _upsert_github_issue_comment(
+    *,
+    session,
+    base_url: str,
+    repo: str,
+    issue_number: int,
+    marker: str,
+    body: str,
+):
+    root = base_url.rstrip("/")
+    comments_url = f"{root}/repos/{repo}/issues/{issue_number}/comments"
+    comments_response = session.get(comments_url, timeout=_REQUEST_TIMEOUT)
+
+    if comments_response.status_code < 400:
+        comments = comments_response.json()
+        if isinstance(comments, list):
+            for comment in comments:
+                if isinstance(comment, dict) and marker in str(comment.get("body") or "") and comment.get("id"):
+                    patch_url = f"{root}/repos/{repo}/issues/comments/{comment['id']}"
+                    return session.patch(patch_url, json={"body": body}, timeout=_REQUEST_TIMEOUT)
+
+    return session.post(comments_url, json={"body": body}, timeout=_REQUEST_TIMEOUT)
 
 
 def _build_comment_body(finding: ReviewFinding) -> str:

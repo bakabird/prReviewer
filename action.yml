@@ -55,9 +55,17 @@ inputs:
     required: false
     default: 'true'
   trigger:
-    description: 'Review trigger mode: bulk_commit or comment'
+    description: 'Review trigger mode: bulk_commit, comment, or full_pr'
     required: false
     default: 'bulk_commit'
+  pr_number:
+    description: 'Pull request number for workflow-dispatched full_pr reviews'
+    required: false
+    default: ''
+  expected_head_sha:
+    description: 'Expected PR head SHA for workflow-dispatched full_pr reviews'
+    required: false
+    default: ''
   reviewer_bot_name:
     description: 'Bot command name for comment-triggered reviews, without the leading @'
     required: false
@@ -96,6 +104,8 @@ runs:
         INPUT_EXCLUDE: ${{ inputs.exclude }}
         INPUT_POST_COMMENTS: ${{ inputs.post_comments }}
         INPUT_TRIGGER: ${{ inputs.trigger }}
+        INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        INPUT_EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
         INPUT_REVIEWER_BOT_NAME: ${{ inputs.reviewer_bot_name }}
         INPUT_ALLOWED_AUTHOR_ASSOCIATIONS: ${{ inputs.allowed_author_associations }}
         PR_NUMBER: ${{ github.event.pull_request.number }}

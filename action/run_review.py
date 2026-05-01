@@ -27,7 +27,9 @@ class ReviewCommand:
     model: str | None = None
     start_sha: str | None = None
     head_sha: str | None = None
+    expected_head_sha: str | None = None
     update_state: bool = False
+    gate_relevant: bool = False
 
 
 def main() -> int:
@@ -54,6 +56,8 @@ def main() -> int:
         event_name=event_name,
         event=event,
         pr_number=pr_number,
+        input_pr_number=os.environ.get("INPUT_PR_NUMBER"),
+        expected_head_sha=os.environ.get("INPUT_EXPECTED_HEAD_SHA"),
         reviewer_bot_name=reviewer_bot_name,
         allowed_author_associations=allowed_author_associations,
     )
@@ -70,6 +74,16 @@ def main() -> int:
         print("::error::Missing api_key input. Set it to your OpenAI (or compatible) API key.", file=sys.stderr)
         return 1
 
+    if command.expected_head_sha:
+        actual_head_sha = _fetch_pr_head_sha(repo, pr_number, token)
+        if actual_head_sha != command.expected_head_sha:
+            print(
+                "::error::Expected PR head SHA "
+                f"{command.expected_head_sha} but found {actual_head_sha}.",
+                file=sys.stderr,
+            )
+            return 1
+
     print(f"Fetching diff for PR #{pr_number} in {repo}...")
     diff_text = _fetch_review_diff(repo, pr_number, token, command)
     if not diff_text or not diff_text.strip():
@@ -84,10 +98,14 @@ def main() -> int:
             print("All files matched exclude patterns — nothing to review.")
             return 0
 
+    report_path = None
+
     # Write diff to temp file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
         f.write(diff_text)
         diff_path = f.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        report_path = f.name
 
     effective_model = command.model or default_model
     effective_models = _parse_models_input(models_input, fallback_model=effective_model)
@@ -122,6 +140,7 @@ def main() -> int:
             "--pr",
             str(pr_number),
         ])
+    cmd.extend(["--report-json", report_path])
 
     model_label = ",".join(effective_models)
     print(f"Running review (mode={mode}, model={model_label})...")
@@ -135,9 +154,19 @@ def main() -> int:
         print(f"::error::Review exited with code {result.returncode}", file=sys.stderr)
         return result.returncode
 
+    review_report = _load_review_report(report_path)
+    with contextlib.suppress(OSError):
+        os.unlink(report_path)
+
     if post_comments and command.update_state and command.head_sha:
         try:
-            _write_review_state(repo, pr_number, token, command.head_sha)
+            _write_review_state(
+                repo,
+                pr_number,
+                token,
+                command.head_sha,
+                gate=_build_gate_state(review_report, command=command),
+            )
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) else 1
             print("::error::Review completed but failed to persist last reviewed SHA.", file=sys.stderr)
@@ -182,12 +211,31 @@ def _resolve_review_request(
     event_name: str,
     event: dict,
     pr_number: str | None,
+    input_pr_number: str | None,
+    expected_head_sha: str | None,
     reviewer_bot_name: str,
     allowed_author_associations: str,
 ) -> tuple[str, ReviewCommand] | None:
-    if trigger not in {"bulk_commit", "comment"}:
+    if trigger not in {"bulk_commit", "comment", "full_pr"}:
         print(f"::error::Unsupported trigger input: {trigger}", file=sys.stderr)
         raise SystemExit(1)
+
+    normalized_input_pr_number = (input_pr_number or "").strip()
+    normalized_expected_head_sha = (expected_head_sha or "").strip() or None
+
+    if trigger == "full_pr":
+        resolved_pr_number = normalized_input_pr_number or pr_number
+        if not resolved_pr_number:
+            print("::error::full_pr trigger requires pr_number.", file=sys.stderr)
+            raise SystemExit(1)
+        return resolved_pr_number, ReviewCommand(
+            scope="full",
+            count=0,
+            head_sha=normalized_expected_head_sha,
+            expected_head_sha=normalized_expected_head_sha,
+            update_state=True,
+            gate_relevant=True,
+        )
 
     if event_name == "issue_comment":
         if trigger == "bulk_commit":
@@ -371,6 +419,15 @@ def _fetch_pr_metadata(repo: str, pr_number: str, token: str | None) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _fetch_pr_head_sha(repo: str, pr_number: str, token: str | None) -> str:
+    payload = _fetch_pr_metadata(repo, pr_number, token)
+    head_sha = str(payload.get("head", {}).get("sha") or "")
+    if not head_sha:
+        print("::error::Could not resolve PR head SHA.", file=sys.stderr)
+        raise SystemExit(1)
+    return head_sha
+
+
 def _fetch_pr_commits(repo: str, pr_number: str, token: str | None) -> list[dict]:
     commits: list[dict] = []
     page = 1
@@ -395,6 +452,7 @@ class ReviewState:
     comment_id: int | None
     last_reviewed_sha: str
     updated_at: str
+    gate: dict | None = None
     version: int = 1
 
 
@@ -414,16 +472,26 @@ def _read_review_state(repo: str, pr_number: str, token: str | None) -> ReviewSt
         comment_id=int(comment["id"]) if comment.get("id") else None,
         last_reviewed_sha=state["last_reviewed_sha"],
         updated_at=state["updated_at"],
+        gate=state.get("gate") if isinstance(state.get("gate"), dict) else None,
         version=int(state.get("version", 1)),
     )
 
 
-def _write_review_state(repo: str, pr_number: str, token: str | None, head_sha: str) -> None:
+def _write_review_state(
+    repo: str,
+    pr_number: str,
+    token: str | None,
+    head_sha: str,
+    *,
+    gate: dict | None = None,
+) -> None:
     payload = {
         "version": 1,
         "last_reviewed_sha": head_sha,
         "updated_at": datetime.now(UTC).isoformat(),
     }
+    if gate is not None:
+        payload["gate"] = gate
     body = _format_state_comment(payload)
     comment = _find_state_comment(repo, pr_number, token)
     if comment and comment.get("id"):
@@ -477,6 +545,49 @@ def _extract_state_from_comment(body: str) -> dict | None:
 def _format_state_comment(payload: dict) -> str:
     state_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     return f"{STATE_MARKER_PREFIX}\n{state_json}\n{STATE_MARKER_SUFFIX}"
+
+
+def _load_review_report(path: str | None) -> dict:
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_gate_state(review_report: dict, *, command: ReviewCommand) -> dict | None:
+    if not command.gate_relevant:
+        return None
+
+    severity_counts = review_report.get("severity_counts")
+    if not isinstance(severity_counts, dict):
+        severity_counts = {"high": 0, "medium": 0, "low": 0, "unparseable": 0}
+
+    fallback_findings = review_report.get("fallback_findings")
+    if not isinstance(fallback_findings, list):
+        fallback_findings = []
+
+    posting_errors = review_report.get("posting_errors")
+    if not isinstance(posting_errors, list):
+        posting_errors = []
+
+    return {
+        "status": "completed",
+        "source": "full_pr",
+        "expected_head_sha": command.expected_head_sha,
+        "severity_counts": {
+            "high": int(severity_counts.get("high", 0) or 0),
+            "medium": int(severity_counts.get("medium", 0) or 0),
+            "low": int(severity_counts.get("low", 0) or 0),
+            "unparseable": int(severity_counts.get("unparseable", 0) or 0),
+        },
+        "fallback_findings": fallback_findings,
+        "errors": [str(error) for error in posting_errors],
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
 
 
 def _fetch_github_json(url: str, token: str | None):

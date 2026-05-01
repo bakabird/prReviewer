@@ -90,12 +90,20 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    def __init__(self, *, get_responses: list[_FakeResponse], post_responses: list[_FakeResponse]) -> None:
+    def __init__(
+        self,
+        *,
+        get_responses: list[_FakeResponse],
+        post_responses: list[_FakeResponse],
+        patch_responses: list[_FakeResponse] | None = None,
+    ) -> None:
         self.headers: dict[str, str] = {}
         self._get_responses = get_responses
         self._post_responses = post_responses
+        self._patch_responses = patch_responses or []
         self.get_calls: list[tuple] = []
         self.post_calls: list[tuple] = []
+        self.patch_calls: list[tuple] = []
 
     def get(self, url: str, timeout=None):
         self.get_calls.append((url, timeout))
@@ -104,6 +112,10 @@ class _FakeSession:
     def post(self, url: str, json: dict, timeout=None):
         self.post_calls.append((url, json, timeout))
         return self._post_responses.pop(0)
+
+    def patch(self, url: str, json: dict, timeout=None):
+        self.patch_calls.append((url, json, timeout))
+        return self._patch_responses.pop(0)
 
 
 def test_github_dry_run_posting_requires_no_token_or_network() -> None:
@@ -374,7 +386,7 @@ def test_github_422_skips_finding(
 ) -> None:
     """Test that GitHub 422 responses trigger fallback when fallback also fails."""
     session = _FakeSession(
-        get_responses=[_FakeResponse(200, {"head": {"sha": "abc123"}})],
+        get_responses=[_FakeResponse(200, {"head": {"sha": "abc123"}}), _FakeResponse(200, [])],
         post_responses=[
             _FakeResponse(422, {}, text="Unprocessable Entity"),
             _FakeResponse(500, {}, text="Internal Server Error"),  # fallback fails
@@ -405,7 +417,7 @@ def test_github_fallback_comment_on_422(
 ) -> None:
     """When inline comment returns 422, a fallback issue comment is posted."""
     session = _FakeSession(
-        get_responses=[_FakeResponse(200, {"head": {"sha": "abc123"}})],
+        get_responses=[_FakeResponse(200, {"head": {"sha": "abc123"}}), _FakeResponse(200, [])],
         post_responses=[
             _FakeResponse(422, {}, text="Unprocessable Entity"),  # inline rejected
             _FakeResponse(201, {}),  # fallback issue comment succeeds
@@ -434,6 +446,8 @@ def test_github_fallback_comment_on_422(
     fallback_url, fallback_payload, _ = session.post_calls[1]
     assert "/issues/1/comments" in fallback_url
     assert "could not post as inline comments" in fallback_payload["body"].lower()
+    assert "<!-- pr-reviewer-fallback-summary -->" in fallback_payload["body"]
+    assert report.fallback_findings[0]["severity"] == "medium"
 
 
 def test_github_fallback_comment_failure(
@@ -441,7 +455,7 @@ def test_github_fallback_comment_failure(
 ) -> None:
     """When both inline and fallback fail, errors are recorded and finding stays skipped."""
     session = _FakeSession(
-        get_responses=[_FakeResponse(200, {"head": {"sha": "abc123"}})],
+        get_responses=[_FakeResponse(200, {"head": {"sha": "abc123"}}), _FakeResponse(200, [])],
         post_responses=[
             _FakeResponse(422, {}, text="Unprocessable Entity"),  # inline rejected
             _FakeResponse(500, {}, text="Internal Server Error"),  # fallback fails
@@ -465,6 +479,38 @@ def test_github_fallback_comment_failure(
     assert report.skipped == 1
     assert report.fallback_posted == 0
     assert any("Fallback summary comment failed" in e for e in report.errors)
+
+
+def test_github_fallback_comment_updates_existing_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _FakeSession(
+        get_responses=[
+            _FakeResponse(200, {"head": {"sha": "abc123"}}),
+            _FakeResponse(200, [{"id": 44, "body": "<!-- pr-reviewer-fallback-summary -->\nold"}]),
+        ],
+        post_responses=[_FakeResponse(422, {}, text="Unprocessable Entity")],
+        patch_responses=[_FakeResponse(200, {})],
+    )
+    monkeypatch.setattr("pr_reviewer.integrations.requests.Session", lambda: session)
+
+    report = post_findings(
+        platform="github",
+        result=_result(),
+        diff_text=SAMPLE_DIFF,
+        repo="owner/repo",
+        pr_number=1,
+        mr_iid=None,
+        token="github-token",
+        base_url="https://api.github.com",
+        dry_run=False,
+    )
+
+    assert report.posted == 1
+    assert len(session.post_calls) == 1
+    patch_url, patch_payload, _ = session.patch_calls[0]
+    assert "/issues/comments/44" in patch_url
+    assert "Changed return value" in patch_payload["body"]
 
 
 def test_github_no_fallback_when_all_inline_succeed(
