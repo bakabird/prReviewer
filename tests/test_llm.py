@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 
-from pr_reviewer.llm import LLMError, OpenAICompatibleProvider, ProviderConfigError
+from pr_reviewer.llm import LLMError, OpenAICompatibleProvider, ProviderConfigError, llm_log_context
 
 SIMPLE_SCHEMA = {
     "type": "object",
@@ -89,6 +90,41 @@ def test_max_tokens_is_included_when_configured() -> None:
 
     sent_payload = mock_post.call_args[1]["json"]
     assert sent_payload["max_tokens"] == 321
+
+
+def test_request_and_successful_response_are_logged_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    success_resp = _make_success_response({"summary": "ok", "verdict": "looks good"})
+    system_prompt = "You are a reviewer."
+    user_prompt = "Review this."
+
+    with (
+        caplog.at_level(logging.INFO, logger="pr_reviewer.llm"),
+        patch("pr_reviewer.llm.requests.post", return_value=success_resp),
+    ):
+        provider = OpenAICompatibleProvider(api_key="test-key")
+        with llm_log_context(pass_name="correctness", chunk_index=2, chunk_count=3):
+            provider.complete_json(
+                model="gpt-4",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
+    expected_prompt_chars = len(system_prompt) + len(user_prompt)
+    assert any(
+        "LLM request attempt 1/10" in record.message
+        and "model=gpt-4" in record.message
+        and "pass=correctness" in record.message
+        and "chunk=2/3" in record.message
+        and f"prompt_chars={expected_prompt_chars}" in record.message
+        for record in caplog.records
+    )
+    assert any(
+        "LLM response 200 in" in record.message
+        and "model=gpt-4" in record.message
+        and "pass=correctness" in record.message
+        and "chunk=2/3" in record.message
+        for record in caplog.records
+    )
 
 
 def test_graceful_fallback_on_400() -> None:

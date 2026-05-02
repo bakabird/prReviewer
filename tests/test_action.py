@@ -434,6 +434,7 @@ def test_main_uses_comment_model_override(tmp_path, monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    assert captured_run["cmd"][captured_run["cmd"].index("-m") + 2] == "--verbose"
     assert "--model" in captured_run["cmd"]
     assert captured_run["cmd"][captured_run["cmd"].index("--model") + 1] == "gpt-5.4"
     assert "model=gpt-5.4" in captured.out

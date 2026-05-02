@@ -5,12 +5,15 @@ import logging
 import os
 import random
 import time
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Protocol
 
 import requests
 
 logger = logging.getLogger(__name__)
+_log_context: ContextVar[dict[str, object]] = ContextVar("llm_log_context", default={})
 
 
 class ProviderConfigError(RuntimeError):
@@ -31,6 +34,15 @@ class LLMProvider(Protocol):
         json_schema: dict | None = None,
     ) -> str:
         ...
+
+
+@contextlib.contextmanager
+def llm_log_context(**context: object) -> Iterator[None]:
+    token = _log_context.set({key: value for key, value in context.items() if value is not None})
+    try:
+        yield
+    finally:
+        _log_context.reset(token)
 
 
 @dataclass
@@ -117,6 +129,13 @@ class OpenAICompatibleProvider:
 
         attempt = 1
         while attempt <= attempts:
+            logger.info(
+                "LLM request attempt %d/%d%s prompt_chars=%d",
+                attempt,
+                attempts,
+                _format_log_context(model=model),
+                len(system_prompt) + len(user_prompt),
+            )
             t0 = time.monotonic()
             try:
                 response = requests.post(
@@ -143,7 +162,12 @@ class OpenAICompatibleProvider:
                 ) from exc
 
             elapsed = time.monotonic() - t0
-            logger.debug("LLM response %d in %.2fs", response.status_code, elapsed)
+            logger.info(
+                "LLM response %d in %.2fs%s",
+                response.status_code,
+                elapsed,
+                _format_log_context(model=model),
+            )
 
             # Graceful fallback: if json_schema mode gets 400, retry with json_object
             if response.status_code == 400 and json_schema and payload["response_format"]["type"] == "json_schema":
@@ -226,6 +250,22 @@ def _resolve_positive_int(*, value: int | None, env_name: str, default: int) -> 
     if resolved <= 0:
         raise ProviderConfigError(f"{env_name} must be greater than 0, got {resolved}.")
     return resolved
+
+
+def _format_log_context(*, model: str) -> str:
+    context = _log_context.get()
+    parts = [f"model={model}"]
+
+    pass_name = context.get("pass_name")
+    if pass_name:
+        parts.append(f"pass={pass_name}")
+
+    chunk_index = context.get("chunk_index")
+    chunk_count = context.get("chunk_count")
+    if chunk_index is not None and chunk_count is not None:
+        parts.append(f"chunk={chunk_index}/{chunk_count}")
+
+    return " (" + " ".join(parts) + ")"
 
 
 def _resolve_optional_positive_int(*, value: int | None, env_name: str) -> int | None:

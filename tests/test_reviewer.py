@@ -1,4 +1,5 @@
 import json
+import logging
 
 from pr_reviewer.llm import LLMError
 import pytest
@@ -140,7 +141,7 @@ def test_multi_pass_review_dedupes_and_annotates_findings() -> None:
     assert duplicate_merged.on_changed_line is True
 
 
-def test_single_pass_review_splits_large_diffs_into_chunks() -> None:
+def test_single_pass_review_splits_large_diffs_into_chunks(caplog: pytest.LogCaptureFixture) -> None:
     responses = [
         json.dumps(
             {
@@ -186,7 +187,8 @@ def test_single_pass_review_splits_large_diffs_into_chunks() -> None:
 
     provider = FakeProvider(responses)
     reviewer = PRReviewer(provider)
-    result = reviewer.review(diff_text=BIG_DIFF, model="fake", review_mode="single", max_lines=11)
+    with caplog.at_level(logging.INFO, logger="pr_reviewer.reviewer"):
+        result = reviewer.review(diff_text=BIG_DIFF, model="fake", review_mode="single", max_lines=11)
 
     assert len(provider.prompts) == 3
     assert "Chunk: 1 of 2" in provider.prompts[0]
@@ -198,6 +200,7 @@ def test_single_pass_review_splits_large_diffs_into_chunks() -> None:
     assert result.verdict.value == "high risk"
     assert len(result.findings) == 2
     assert any("split the diff into 2 chunk(s)" in warning for warning in result.warnings)
+    assert any("Diff chunking:" in record.message and "-> 2 chunk(s)" in record.message for record in caplog.records)
 
 
 def test_multi_pass_review_handles_chunked_diffs_and_dedupes_results() -> None:

@@ -7,7 +7,7 @@ from difflib import SequenceMatcher
 
 from pydantic import ValidationError
 
-from .llm import LLMError, LLMProvider
+from .llm import LLMError, LLMProvider, llm_log_context
 from .models import (
     Category,
     ChunkSynthesisPayload,
@@ -161,6 +161,12 @@ class PRReviewer:
         stats = parsed_diff.stats
 
         diff_chunks, was_chunked, original_line_count = chunk_diff(diff_text, max_lines=max_lines)
+        logger.info(
+            "Diff chunking: %d line(s), max %d line(s)/chunk -> %d chunk(s)",
+            original_line_count,
+            max_lines,
+            len(diff_chunks),
+        )
         if was_chunked:
             stats.original_line_count = original_line_count
 
@@ -538,12 +544,13 @@ class PRReviewer:
         )
 
         try:
-            raw_response = self.provider.complete_json(
-                model=model,
-                system_prompt=SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                json_schema=REVIEW_JSON_SCHEMA,
-            )
+            with llm_log_context(pass_name=pass_name, chunk_index=chunk_index, chunk_count=chunk_count):
+                raw_response = self.provider.complete_json(
+                    model=model,
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    json_schema=REVIEW_JSON_SCHEMA,
+                )
         except LLMError as exc:
             logger.warning("LLM call failed for pass=%s chunk=%d/%d: %s", pass_name, chunk_index, chunk_count, exc)
             return None, str(exc), f"LLM call failed: {exc}"
@@ -669,12 +676,13 @@ class PRReviewer:
             chunk_reviews=chunk_reviews,
         )
 
-        raw_response = self.provider.complete_json(
-            model=model,
-            system_prompt=SYNTHESIS_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            json_schema=SYNTHESIS_JSON_SCHEMA,
-        )
+        with llm_log_context(pass_name="synthesis"):
+            raw_response = self.provider.complete_json(
+                model=model,
+                system_prompt=SYNTHESIS_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                json_schema=SYNTHESIS_JSON_SCHEMA,
+            )
 
         payload, parse_warning = _parse_synthesis_payload(raw_response)
         if payload is None:

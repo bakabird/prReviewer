@@ -115,6 +115,7 @@ def main() -> int:
         sys.executable,
         "-m",
         "pr_reviewer",
+        "--verbose",
         "review",
         diff_path,
         "--mode",
