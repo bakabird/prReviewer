@@ -533,7 +533,8 @@ def _print_posting_report(*, report, dry_run: bool) -> None:
     mode = "dry-run posted" if dry_run else "posted"
     print(
         f"{report.platform} comments {mode}: {report.posted}/{report.attempted} "
-        f"(skipped: {report.skipped})",
+        f"(skipped: {report.skipped}; inline: {report.inline}, summary: {report.summary}, "
+        f"dropped: {report.dropped})",
         file=sys.stderr,
     )
     for error in report.errors[:8]:
@@ -544,6 +545,8 @@ def _write_report_json(path: str, *, result, posting_report) -> None:
     output_path = Path(path).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     findings = [finding.model_dump(mode="json") for finding in result.findings]
+    summary_findings = [finding.model_dump(mode="json") for finding in result.summary_findings]
+    dropped_findings = [finding.model_dump(mode="json") for finding in result.dropped_findings]
     severity_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0, "unparseable": 0}
     for finding in findings:
         severity = str(finding.get("severity") or "unparseable").lower()
@@ -558,11 +561,27 @@ def _write_report_json(path: str, *, result, posting_report) -> None:
         "model": result.model,
         "review_mode": result.review_mode,
         "severity_counts": severity_counts,
+        "filter_counts": {
+            "inline": len(findings),
+            "summary": len(summary_findings),
+            "dropped": len(dropped_findings),
+        },
         "findings": findings,
+        "summary_findings": summary_findings,
+        "dropped_findings": dropped_findings,
         "fallback_findings": [],
         "posting_errors": [],
     }
     if posting_report is not None:
+        payload["posting_counts"] = {
+            "attempted": posting_report.attempted,
+            "posted": posting_report.posted,
+            "skipped": posting_report.skipped,
+            "inline": posting_report.inline,
+            "summary": posting_report.summary,
+            "dropped": posting_report.dropped,
+            "fallback_posted": posting_report.fallback_posted,
+        }
         payload["fallback_findings"] = posting_report.fallback_findings
         payload["posting_errors"] = posting_report.errors
 

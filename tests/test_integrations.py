@@ -136,6 +136,49 @@ def test_github_dry_run_posting_requires_no_token_or_network() -> None:
     assert report.posted == 1
 
 
+def test_posting_report_includes_filter_counts() -> None:
+    result = _result()
+    result.summary_findings.append(
+        ReviewFinding(
+            severity=Severity.low,
+            category=Category.performance,
+            title="Minor query cost",
+            explanation="This is plausible but not worth an inline interruption.",
+            file="app/a.py",
+            line=2,
+            confidence=0.62,
+        )
+    )
+    result.dropped_findings.append(
+        ReviewFinding(
+            severity=Severity.low,
+            category=Category.maintainability,
+            title="Contradicted note",
+            explanation="The broader file context contradicts this finding.",
+            file="app/a.py",
+            line=2,
+            confidence=0.80,
+        )
+    )
+
+    report = post_findings(
+        platform="github",
+        result=result,
+        diff_text=SAMPLE_DIFF,
+        repo="owner/repo",
+        pr_number=1,
+        mr_iid=None,
+        token=None,
+        base_url=None,
+        dry_run=True,
+    )
+
+    assert report.inline == 1
+    assert report.summary == 1
+    assert report.dropped == 1
+    assert report.attempted == 1
+
+
 def test_dry_run_counts_unpostable_findings_as_skipped() -> None:
     result = ReviewResult(
         summary="two findings",

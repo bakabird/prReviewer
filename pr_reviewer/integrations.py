@@ -27,6 +27,9 @@ class IntegrationError(RuntimeError):
 @dataclass
 class PostingReport:
     platform: str
+    inline: int = 0
+    summary: int = 0
+    dropped: int = 0
     attempted: int = 0
     posted: int = 0
     skipped: int = 0
@@ -100,6 +103,9 @@ def _post_to_github(
         raise IntegrationError("GitHub posting requires --pr <number>")
 
     report = PostingReport(platform="github")
+    report.inline = len(result.findings)
+    report.summary = len(result.summary_findings)
+    report.dropped = len(result.dropped_findings)
     postable_findings, skipped_before_post = _collect_postable_findings(result, parsed_diff)
     report.skipped += skipped_before_post
 
@@ -207,6 +213,9 @@ def _post_to_gitlab(
         raise IntegrationError("GitLab posting requires --mr <iid>")
 
     report = PostingReport(platform="gitlab")
+    report.inline = len(result.findings)
+    report.summary = len(result.summary_findings)
+    report.dropped = len(result.dropped_findings)
     postable_findings, skipped_before_post = _collect_postable_findings(result, parsed_diff)
     report.skipped += skipped_before_post
 
@@ -408,8 +417,11 @@ def _build_fallback_summary_body(
             f"### [{finding.severity.value.upper()}][{finding.category.value}] {finding.title}\n"
             f"**Location**: {location}  \n"
             f"**Confidence**: {finding.confidence:.2f}  \n"
+            f"**Evidence**: {finding.evidence.value}  \n"
             f"**Why it matters**: {finding.explanation}\n"
         )
+        if finding.impact:
+            lines.append(f"**Impact**: {finding.impact}\n")
         if finding.suggested_fix:
             lines.append(f"**Suggested fix**: {finding.suggested_fix}\n")
         lines.append("")
@@ -424,6 +436,8 @@ def _serialize_fallback_finding(finding: ReviewFinding, target: CommentTarget) -
         "file": target.file_path,
         "line": finding.line,
         "confidence": finding.confidence,
+        "evidence": finding.evidence.value,
+        "impact": finding.impact,
         "explanation": finding.explanation,
         "suggested_fix": finding.suggested_fix,
     }
@@ -457,9 +471,13 @@ def _build_comment_body(finding: ReviewFinding) -> str:
     lines = [
         f"**[{finding.severity.value.upper()}][{finding.category.value}] {finding.title}**",
         f"Confidence: {finding.confidence:.2f}",
+        f"Evidence: {finding.evidence.value}",
         "",
         f"Why it matters: {finding.explanation}",
     ]
+
+    if finding.impact:
+        lines.append(f"Impact: {finding.impact}")
 
     if finding.suggested_fix:
         lines.append(f"Suggested fix: {finding.suggested_fix}")

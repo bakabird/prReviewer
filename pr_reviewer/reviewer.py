@@ -12,6 +12,8 @@ from .models import (
     Category,
     ChunkSynthesisPayload,
     DiffStats,
+    EvidenceBasis,
+    FindingDisposition,
     LLMReviewPayload,
     ReviewFinding,
     ReviewResult,
@@ -45,6 +47,8 @@ JSON schema:
       "file": "optional file path",
       "line": 123,
       "confidence": 0.0,
+      "evidence": "direct" | "inferred" | "speculative" | "missing-context",
+      "impact": "optional concrete impact",
       "suggested_fix": "optional practical fix"
     }
   ]
@@ -54,6 +58,12 @@ Confidence guidance:
 - 0.90-1.00: very likely issue based on explicit evidence in the diff
 - 0.70-0.89: likely issue with minor uncertainty
 - 0.40-0.69: plausible risk, less certain
+
+Evidence guidance:
+- direct: visible diff/context proves the issue, e.g. a new branch dereferences None or calls a removed symbol.
+- inferred: visible evidence supports the issue, but one link depends on surrounding control flow or project context.
+- speculative: possible future-maintenance or hardening concern; do not label these as high-confidence direct bugs.
+- missing-context: the concern depends on code omitted from the visible diff or truncated context.
 """
 
 SYNTHESIS_SYSTEM_PROMPT = """You are an expert senior software engineer consolidating chunked PR review results.
@@ -88,9 +98,14 @@ REVIEW_JSON_SCHEMA: dict = {
                     "file": {"type": ["string", "null"]},
                     "line": {"type": ["integer", "null"]},
                     "confidence": {"type": "number"},
+                    "evidence": {
+                        "type": "string",
+                        "enum": ["direct", "inferred", "speculative", "missing-context"],
+                    },
+                    "impact": {"type": ["string", "null"]},
                     "suggested_fix": {"type": ["string", "null"]},
                 },
-                "required": ["severity", "category", "title", "explanation", "confidence"],
+                "required": ["severity", "category", "title", "explanation", "confidence", "evidence"],
                 "additionalProperties": False,
             },
         },
@@ -138,6 +153,32 @@ _DUPLICATE_SAME_LOCATION_TITLE_THRESHOLD = 0.55
 _DUPLICATE_TITLE_THRESHOLD = 0.84
 _DUPLICATE_TITLE_WITH_EXPLANATION_THRESHOLD = 0.70
 _DUPLICATE_EXPLANATION_THRESHOLD = 0.72
+_DROP_CONFIDENCE_THRESHOLD = 0.40
+_INLINE_CONFIDENCE_THRESHOLD = 0.70
+_SUMMARY_CONFIDENCE_THRESHOLD = 0.55
+_SPECULATIVE_SECURITY_PHRASES = (
+    "if later",
+    "if this is later",
+    "if modified",
+    "if changed",
+    "could allow",
+    "could be",
+    "may allow",
+    "might allow",
+    "potentially",
+)
+_AUTH_TERMS = ("auth", "authorization", "authentication", "permission", "access control")
+_AUTH_CONTEXT_TERMS = (
+    "auth",
+    "authorization",
+    "authentication",
+    "permission",
+    "rbac",
+    "acl",
+    "login",
+    "session",
+    "jwt",
+)
 
 
 class PRReviewer:
@@ -341,7 +382,19 @@ class PRReviewer:
                 f"Could not attach hunk context for {missing_context} finding(s); file/line may not map to visible hunks."
             )
 
-        sorted_findings = _sort_findings(findings)
+        inline_findings, summary_findings, dropped_findings = filter_findings(
+            findings,
+            file_context=file_context,
+            project_context=project_context,
+        )
+        if summary_findings or dropped_findings:
+            warnings.append(
+                "Filtered review findings before posting "
+                f"(inline: {len(inline_findings)}, summary: {len(summary_findings)}, "
+                f"dropped: {len(dropped_findings)})."
+            )
+
+        sorted_findings = _sort_findings(inline_findings)
         if chunk_count == 1 and len(payloads) == 1:
             summary = payloads[0].summary
             verdict = payloads[0].verdict
@@ -370,6 +423,8 @@ class PRReviewer:
             review_mode="single",
             passes_run=["general"],
             warnings=warnings,
+            summary_findings=_sort_findings(summary_findings),
+            dropped_findings=_sort_findings(dropped_findings),
         )
 
     def _review_multi(
@@ -481,8 +536,20 @@ class PRReviewer:
                 f"Could not attach hunk context for {missing_context} finding(s); file/line may not map to visible hunks."
             )
 
+        inline_findings, summary_findings, dropped_findings = filter_findings(
+            annotated_findings,
+            file_context=file_context,
+            project_context=project_context,
+        )
+        if summary_findings or dropped_findings:
+            warnings.append(
+                "Filtered review findings before posting "
+                f"(inline: {len(inline_findings)}, summary: {len(summary_findings)}, "
+                f"dropped: {len(dropped_findings)})."
+            )
+
         pass_verdicts = [payload.verdict for _, payload in payloads]
-        sorted_findings = _sort_findings(annotated_findings)
+        sorted_findings = _sort_findings(inline_findings)
         verdict = _infer_verdict(sorted_findings, pass_verdicts)
         summary = _build_multi_summary(payloads, sorted_findings, chunk_count=chunk_count)
         if chunk_count > 1:
@@ -507,6 +574,8 @@ class PRReviewer:
             review_mode="multi",
             passes_run=successful_passes,
             warnings=warnings,
+            summary_findings=_sort_findings(summary_findings),
+            dropped_findings=_sort_findings(dropped_findings),
         )
 
     def _run_pass(
@@ -628,7 +697,10 @@ class PRReviewer:
             "- Keep findings actionable and concise.\n"
             "- Avoid duplicate findings; include only meaningful issues for this pass.\n"
             "- If this is one chunk of a larger diff, do not speculate about code outside this chunk.\n"
-            "- If uncertain, lower confidence instead of overstating.\n\n"
+            "- If uncertain, lower confidence and use evidence='inferred', 'speculative', or 'missing-context'.\n"
+            "- Reserve evidence='direct' for findings proven by visible diff/context evidence.\n"
+            "- Use evidence='speculative' for future-maintenance risks, including currently safe security patterns that could become unsafe after later edits.\n"
+            "- Use evidence='missing-context' when a truncated diff or omitted file prevents verification.\n\n"
             f"{project_block}"
             f"{context_block}"
             "DIFF_START\n"
@@ -858,22 +930,151 @@ def _dedupe_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
     return merged
 
 
+def filter_findings(
+    findings: list[ReviewFinding],
+    *,
+    file_context: dict[str, str] | None = None,
+    project_context: dict[str, str] | None = None,
+) -> tuple[list[ReviewFinding], list[ReviewFinding], list[ReviewFinding]]:
+    inline: list[ReviewFinding] = []
+    summary: list[ReviewFinding] = []
+    dropped: list[ReviewFinding] = []
+
+    for finding in findings:
+        calibrated = finding.model_copy(deep=True)
+        disposition, reason = _classify_finding(
+            calibrated,
+            file_context=file_context,
+            project_context=project_context,
+        )
+        calibrated.post_level = disposition
+        calibrated.filter_reason = reason
+
+        if disposition == FindingDisposition.inline:
+            inline.append(calibrated)
+        elif disposition == FindingDisposition.summary:
+            summary.append(calibrated)
+        else:
+            dropped.append(calibrated)
+
+    return inline, summary, dropped
+
+
+def _classify_finding(
+    finding: ReviewFinding,
+    *,
+    file_context: dict[str, str] | None,
+    project_context: dict[str, str] | None,
+) -> tuple[FindingDisposition, str]:
+    if not finding.file or not finding.line or finding.on_changed_line is False:
+        return FindingDisposition.drop, "finding does not map to a changed diff line"
+
+    if finding.confidence < _DROP_CONFIDENCE_THRESHOLD:
+        return FindingDisposition.drop, "confidence below drop threshold"
+
+    if _undefined_symbol_has_local_declaration(finding, file_context):
+        return FindingDisposition.drop, "undefined-symbol claim contradicted by file context"
+
+    if finding.evidence == EvidenceBasis.missing_context:
+        return FindingDisposition.summary, "finding depends on missing context"
+
+    if finding.confidence < _SUMMARY_CONFIDENCE_THRESHOLD:
+        return FindingDisposition.summary, "confidence below inline threshold"
+
+    if finding.evidence == EvidenceBasis.speculative:
+        return FindingDisposition.summary, "finding is speculative"
+
+    if _is_speculative_security_finding(finding):
+        return FindingDisposition.summary, "security claim is speculative"
+
+    if _is_auth_warning_without_project_convention(finding, project_context):
+        return FindingDisposition.summary, "auth warning lacks supporting project convention context"
+
+    if finding.confidence < _INLINE_CONFIDENCE_THRESHOLD:
+        return FindingDisposition.summary, "confidence below inline threshold"
+
+    if finding.severity == Severity.low and finding.category in {Category.performance, Category.maintainability}:
+        return FindingDisposition.summary, "low-severity suggestion is better suited for summary"
+
+    return FindingDisposition.inline, "direct actionable finding"
+
+
+def _undefined_symbol_has_local_declaration(
+    finding: ReviewFinding,
+    file_context: dict[str, str] | None,
+) -> bool:
+    if not finding.file or not file_context:
+        return False
+
+    text = f"{finding.title}\n{finding.explanation}"
+    if not re.search(r"\b(undefined|not defined|cannot find|unresolved|missing)\b", text, flags=re.IGNORECASE):
+        return False
+
+    symbol_match = re.search(
+        r"(?:undefined|not defined|cannot find|unresolved|missing)\s+(?:symbol|reference|dependency|function|name)?\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if symbol_match is None:
+        return False
+
+    symbol = symbol_match.group(1)
+    content = file_context.get(finding.file) or file_context.get(normalize_diff_path(finding.file))
+    if not content:
+        return False
+
+    declaration_patterns = [
+        rf"\bdef\s+{re.escape(symbol)}\s*\(",
+        rf"\bclass\s+{re.escape(symbol)}\b",
+        rf"\b(?:const|let|var|function)\s+{re.escape(symbol)}\b",
+        rf"\b{re.escape(symbol)}\s*[:=]",
+    ]
+    return any(re.search(pattern, content) for pattern in declaration_patterns)
+
+
+def _is_speculative_security_finding(finding: ReviewFinding) -> bool:
+    if finding.category != Category.security:
+        return False
+    text = f"{finding.title}\n{finding.explanation}".lower()
+    return any(phrase in text for phrase in _SPECULATIVE_SECURITY_PHRASES)
+
+
+def _is_auth_warning_without_project_convention(
+    finding: ReviewFinding,
+    project_context: dict[str, str] | None,
+) -> bool:
+    text = f"{finding.title}\n{finding.explanation}".lower()
+    if not any(term in text for term in _AUTH_TERMS):
+        return False
+    if not project_context:
+        return True
+
+    context_text = "\n".join(project_context.values()).lower()
+    return not any(term in context_text for term in _AUTH_CONTEXT_TERMS)
+
+
 def aggregate_review_results(results: list[ReviewResult], *, models: list[str]) -> ReviewResult:
     if not results:
         raise ValueError("at least one review result is required")
     _validate_aggregate_metadata(results)
 
     all_findings: list[ReviewFinding] = []
+    all_summary_findings: list[ReviewFinding] = []
+    all_dropped_findings: list[ReviewFinding] = []
     warnings: list[str] = []
     pass_names: list[str] = []
     verdicts: list[Verdict] = []
     for result in results:
         all_findings.extend(result.findings)
+        all_summary_findings.extend(result.summary_findings)
+        all_dropped_findings.extend(result.dropped_findings)
         warnings.extend(result.warnings)
         pass_names.extend(result.passes_run)
         verdicts.append(result.verdict)
 
     merged_findings = _sort_findings(_dedupe_findings(all_findings))
+    merged_summary_findings = _sort_findings(_dedupe_findings(all_summary_findings))
+    merged_dropped_findings = _sort_findings(_dedupe_findings(all_dropped_findings))
     deduped_count = len(all_findings) - len(merged_findings)
     if deduped_count > 0:
         warnings.append(f"Deduped {deduped_count} overlapping finding(s) across configured models.")
@@ -891,6 +1092,8 @@ def aggregate_review_results(results: list[ReviewResult], *, models: list[str]) 
         review_mode=base.review_mode,
         passes_run=_unique_strings(pass_names),
         warnings=warnings,
+        summary_findings=merged_summary_findings,
+        dropped_findings=merged_dropped_findings,
     )
 
 

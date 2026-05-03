@@ -1,11 +1,11 @@
 import json
 import logging
 
-from pr_reviewer.llm import LLMError
 import pytest
 
-from pr_reviewer.models import Category, DiffStats, ReviewFinding, ReviewResult, Severity, Verdict
-from pr_reviewer.reviewer import PRReviewer, aggregate_review_results
+from pr_reviewer.llm import LLMError
+from pr_reviewer.models import Category, DiffStats, EvidenceBasis, ReviewFinding, ReviewResult, Severity, Verdict
+from pr_reviewer.reviewer import PRReviewer, REVIEW_JSON_SCHEMA, aggregate_review_results, filter_findings
 
 SAMPLE_DIFF = """diff --git a/app/main.py b/app/main.py
 index 1111111..2222222 100644
@@ -133,12 +133,128 @@ def test_multi_pass_review_dedupes_and_annotates_findings() -> None:
 
     assert result.review_mode == "multi"
     assert result.passes_run == ["correctness", "security", "performance"]
-    assert len(result.findings) == 2
+    assert len(result.findings) == 1
+    assert len(result.summary_findings) == 1
 
     duplicate_merged = next(f for f in result.findings if "divide-by-zero" in f.title)
     assert duplicate_merged.confidence == 0.91
     assert duplicate_merged.code_frame is not None
     assert duplicate_merged.on_changed_line is True
+    assert result.summary_findings[0].title == "Minor branching overhead"
+
+
+def test_filter_findings_drops_low_confidence() -> None:
+    finding = ReviewFinding(
+        severity=Severity.medium,
+        category=Category.bug,
+        title="Possible issue",
+        explanation="The evidence is too weak to interrupt review.",
+        file="app/main.py",
+        line=2,
+        confidence=0.30,
+        on_changed_line=True,
+    )
+
+    inline, summary, dropped = filter_findings([finding])
+
+    assert inline == []
+    assert summary == []
+    assert len(dropped) == 1
+    assert dropped[0].post_level == "drop"
+
+
+def test_filter_findings_suppresses_undefined_symbol_with_file_context() -> None:
+    finding = ReviewFinding(
+        severity=Severity.medium,
+        category=Category.bug,
+        title="Undefined escapeHtml dependency",
+        explanation="The updated rendering path calls escapeHtml, but it is not defined.",
+        file="web/view.js",
+        line=8,
+        confidence=0.82,
+        on_changed_line=True,
+    )
+
+    inline, summary, dropped = filter_findings(
+        [finding],
+        file_context={"web/view.js": "const escapeHtml = (value) => String(value);\n"},
+    )
+
+    assert inline == []
+    assert summary == []
+    assert len(dropped) == 1
+    assert "contradicted" in (dropped[0].filter_reason or "")
+
+
+def test_filter_findings_downgrades_speculative_security() -> None:
+    finding = ReviewFinding(
+        severity=Severity.high,
+        category=Category.security,
+        title="Potential authorization bypass",
+        explanation="This could allow a bypass if later modified to accept user-controlled ids.",
+        file="api/users.py",
+        line=20,
+        confidence=0.86,
+        evidence=EvidenceBasis.speculative,
+        on_changed_line=True,
+    )
+
+    inline, summary, dropped = filter_findings([finding])
+
+    assert inline == []
+    assert dropped == []
+    assert len(summary) == 1
+    assert summary[0].post_level == "summary"
+
+
+def test_filter_findings_preserves_direct_bug_inline() -> None:
+    finding = ReviewFinding(
+        severity=Severity.high,
+        category=Category.bug,
+        title="Division by zero",
+        explanation="The new branch passes 0 directly into the reciprocal calculation.",
+        file="app/main.py",
+        line=4,
+        confidence=0.91,
+        on_changed_line=True,
+    )
+
+    inline, summary, dropped = filter_findings([finding])
+
+    assert len(inline) == 1
+    assert summary == []
+    assert dropped == []
+    assert inline[0].post_level == "inline"
+
+
+def test_review_schema_requires_evidence_basis() -> None:
+    finding_schema = REVIEW_JSON_SCHEMA["properties"]["findings"]["items"]
+
+    assert "evidence" in finding_schema["required"]
+    assert finding_schema["properties"]["evidence"]["enum"] == [
+        "direct",
+        "inferred",
+        "speculative",
+        "missing-context",
+    ]
+
+
+def test_prompt_defines_evidence_levels(sample_diff: str) -> None:
+    captured_prompts: list[str] = []
+
+    class CaptureProvider:
+        def complete_json(self, *, model: str, system_prompt: str, user_prompt: str, json_schema=None) -> str:
+            captured_prompts.append(system_prompt)
+            captured_prompts.append(user_prompt)
+            return '{"summary": "ok", "verdict": "looks good", "findings": []}'
+
+    PRReviewer(CaptureProvider()).review(diff_text=sample_diff, model="fake")
+
+    combined = "\n".join(captured_prompts)
+    assert "Evidence guidance" in combined
+    assert "direct" in combined
+    assert "speculative" in combined
+    assert "missing-context" in combined
 
 
 def test_single_pass_review_splits_large_diffs_into_chunks(caplog: pytest.LogCaptureFixture) -> None:

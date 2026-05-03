@@ -95,7 +95,8 @@ def _format_text(result: ReviewResult, *, compact: bool, color: bool) -> str:
             location = f" ({':'.join(location_parts)})" if location_parts else ""
             lines.append(
                 f"{sev} [{finding.category.value}] {finding.title}{location} "
-                f"(confidence: {finding.confidence:.2f})"
+                f"(confidence: {finding.confidence:.2f}, evidence: {finding.evidence.value}"
+                f"{_post_level_suffix(finding)})"
             )
         return "\n".join(lines)
 
@@ -110,6 +111,11 @@ def _format_text(result: ReviewResult, *, compact: bool, color: bool) -> str:
             if finding.line:
                 lines.append(f"Line: {finding.line}")
             lines.append(f"Confidence: {finding.confidence:.2f}")
+            lines.append(f"Evidence: {finding.evidence.value}")
+            if finding.post_level:
+                lines.append(f"Posting intent: {finding.post_level.value}")
+            if finding.impact:
+                lines.append(f"Impact: {finding.impact}")
             lines.append(f"Why it matters: {finding.explanation}")
             if finding.suggested_fix:
                 lines.append(f"Suggested fix: {finding.suggested_fix}")
@@ -153,7 +159,9 @@ def _format_markdown(result: ReviewResult, *, compact: bool) -> str:
             location = f" ({finding.file})" if finding.file else ""
             lines.append(
                 f"- **[{finding.severity.value.upper()}] {finding.title}** "
-                f"`{finding.category.value}`{location} (confidence: {finding.confidence:.2f})"
+                f"`{finding.category.value}`{location} "
+                f"(confidence: {finding.confidence:.2f}, evidence: `{finding.evidence.value}`"
+                f"{_post_level_suffix(finding)})"
             )
         return "\n".join(lines)
 
@@ -166,6 +174,11 @@ def _format_markdown(result: ReviewResult, *, compact: bool) -> str:
         if finding.line:
             lines.append(f"- **Line:** {finding.line}")
         lines.append(f"- **Confidence:** {finding.confidence:.2f}")
+        lines.append(f"- **Evidence:** `{finding.evidence.value}`")
+        if finding.post_level:
+            lines.append(f"- **Posting intent:** `{finding.post_level.value}`")
+        if finding.impact:
+            lines.append(f"- **Impact:** {finding.impact}")
         lines.append(f"- **Why it matters:** {finding.explanation}")
         if finding.suggested_fix:
             lines.append(f"- **Suggested fix:** {finding.suggested_fix}")
@@ -188,6 +201,12 @@ def _severity_counts(findings: list[ReviewFinding]) -> dict[str, int]:
     for finding in findings:
         counts[finding.severity.value] += 1
     return counts
+
+
+def _post_level_suffix(finding: ReviewFinding) -> str:
+    if not finding.post_level:
+        return ""
+    return f", post: {finding.post_level.value}"
 
 
 def _severity_badge(severity: str, color: bool) -> str:
