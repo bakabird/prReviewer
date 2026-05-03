@@ -257,6 +257,30 @@ def test_prompt_defines_evidence_levels(sample_diff: str) -> None:
     assert "missing-context" in combined
 
 
+def test_prompt_defines_context_validation_contract(sample_diff: str) -> None:
+    captured_prompts: list[str] = []
+
+    class CaptureProvider:
+        def complete_json(self, *, model: str, system_prompt: str, user_prompt: str, json_schema=None) -> str:
+            captured_prompts.append(system_prompt)
+            captured_prompts.append(user_prompt)
+            return '{"summary": "ok", "verdict": "looks good", "findings": []}'
+
+    PRReviewer(CaptureProvider()).review(
+        diff_text=sample_diff,
+        model="fake",
+        file_context={"app/main.py": "def escapeHtml(value):\n    return value\n"},
+        project_context={"README.md": "Project conventions\n"},
+    )
+
+    combined = "\n".join(captured_prompts)
+    assert "Use the diff as the only source of new review targets" in combined
+    assert "validate, disprove, or downgrade findings about changed" in combined
+    assert "context-only code" in combined
+    assert "Do not guess that a symbol is undefined when file context shows its declaration" in combined
+    assert "validation only" in combined
+
+
 def test_single_pass_review_splits_large_diffs_into_chunks(caplog: pytest.LogCaptureFixture) -> None:
     responses = [
         json.dumps(

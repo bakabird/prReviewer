@@ -240,7 +240,8 @@ CLI flags override config values. Config values override environment defaults.
 
 ## Known limitations
 
-- The model only sees the diff, not the full codebase (imports, callers, types outside the hunk)
+- Reviews target only code touched by the selected diff. When GitHub context fetching is enabled, full changed-file and project context is used to validate, disprove, or downgrade diff findings, not to report issues in unchanged context-only code.
+- Context may still be incomplete or truncated, so findings that depend on omitted code should be treated as lower-confidence `missing-context` or `inferred` results.
 - LLM quality varies by model and provider
 - Some platform APIs may reject comments if the diff position changed since the review ran
 

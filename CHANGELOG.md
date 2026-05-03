@@ -18,7 +18,10 @@ All notable changes to this project will be documented in this file.
 - Text, Markdown, JSON, fallback summary, and inline comment outputs now surface evidence and posting intent where useful.
 - Low-confidence, speculative security, unmapped, contradicted undefined-symbol, and low-impact suggestion findings are downgraded or dropped before posting.
 - Speculative or missing-context findings are summarized instead of being represented as direct inline bugs.
+- Review prompts now use a two-tier evidence contract: the diff is the only source of new review targets, while file and project context may validate, disprove, or downgrade findings about changed lines.
+- Prompt guidance now explicitly rejects undefined-symbol findings when file context shows the declaration, and prevents findings for unchanged context-only code.
 
 ### Tests
 
 - Added coverage for evidence schema requirements, prompt evidence guidance, low-confidence drops, undefined-symbol context suppression, speculative security downgrades, direct bug preservation, and posting report filter counts.
+- Added coverage for the prompt context-validation contract.

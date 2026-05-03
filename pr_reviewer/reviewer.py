@@ -27,8 +27,10 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You are an expert senior software engineer performing PR review on a unified diff.
 
 Rules:
-- Base every claim only on the provided diff text.
-- Do NOT reference files, symbols, or behavior not visible in the diff.
+- Use the diff as the only source of new review targets.
+- Use provided file/project context to validate, disprove, or downgrade findings about changed diff lines.
+- Do NOT open findings for context-only code that is not touched by the diff.
+- Do NOT guess that symbols are undefined when file context shows their declarations.
 - Prioritize correctness, security, performance, and maintainability.
 - Be direct and specific. Avoid fluff.
 - If there are no meaningful issues, return findings as an empty list.
@@ -60,10 +62,15 @@ Confidence guidance:
 - 0.40-0.69: plausible risk, less certain
 
 Evidence guidance:
-- direct: visible diff/context proves the issue, e.g. a new branch dereferences None or calls a removed symbol.
-- inferred: visible evidence supports the issue, but one link depends on surrounding control flow or project context.
+- direct: changed diff lines prove the issue directly, e.g. a new branch dereferences None.
+- inferred: changed diff lines indicate a likely issue, but validation depends on surrounding file or project context. Lower confidence when context outside the hunk is required.
 - speculative: possible future-maintenance or hardening concern; do not label these as high-confidence direct bugs.
-- missing-context: the concern depends on code omitted from the visible diff or truncated context.
+- missing-context: the concern depends on omitted or truncated context, so present uncertainty explicitly instead of as fact.
+
+Examples:
+- If the diff adds `escapeHtml(value)` and file context contains `function escapeHtml(...)`, reject an undefined-symbol finding.
+- If the diff changes a call site and project context indicates the callee rejects None, mark the finding inferred or drop it if disproven.
+- If a concern is only about an unchanged helper visible in file context, do not report it.
 """
 
 SYNTHESIS_SYSTEM_PROMPT = """You are an expert senior software engineer consolidating chunked PR review results.
@@ -660,8 +667,9 @@ class PRReviewer:
         project_block = ""
         if project_context:
             parts = [
-                "Project context (README, conventions, config — use to understand what this project"
-                " does and how it is structured):\n"
+                "Project context (README, conventions, config; validation only — use to understand"
+                " structure and to validate, disprove, or downgrade diff findings, not to create"
+                " context-only findings):\n"
             ]
             for path, content in project_context.items():
                 parts.append(f"=== {path} ===\n{content}\n=== end {path} ===\n")
@@ -673,8 +681,9 @@ class PRReviewer:
             relevant = {p: c for p, c in file_context.items() if p in chunk_files}
             if relevant:
                 parts = [
-                    "File context (full current content of changed files — use to understand broader"
-                    " structure, but only flag issues that are visible in the diff below):\n"
+                    "File context (full current content of changed files; validation only — use to"
+                    " confirm declarations and surrounding behavior, reject contradicted findings,"
+                    " and lower confidence when needed; do not flag unchanged context-only code):\n"
                 ]
                 for path, content in list(relevant.items())[:10]:
                     parts.append(f"=== {path} ===\n{content}\n=== end {path} ===\n")
@@ -693,12 +702,17 @@ class PRReviewer:
             "- Changed files:\n"
             f"{files_block}\n\n"
             "Constraints:\n"
-            "- Only comment on visible code in the diff.\n"
+            "- Use the diff as the only source of new review targets.\n"
+            "- Only comment on code touched by the visible diff.\n"
+            "- Use file/project context to validate, disprove, or downgrade findings about changed lines.\n"
+            "- Do not open findings for context-only code that is not touched by the diff.\n"
+            "- Do not guess that a symbol is undefined when file context shows its declaration.\n"
             "- Keep findings actionable and concise.\n"
             "- Avoid duplicate findings; include only meaningful issues for this pass.\n"
             "- If this is one chunk of a larger diff, do not speculate about code outside this chunk.\n"
             "- If uncertain, lower confidence and use evidence='inferred', 'speculative', or 'missing-context'.\n"
-            "- Reserve evidence='direct' for findings proven by visible diff/context evidence.\n"
+            "- Reserve evidence='direct' for findings proven by changed diff lines.\n"
+            "- Use evidence='inferred' when the changed diff lines matter but the reasoning depends on file/project context.\n"
             "- Use evidence='speculative' for future-maintenance risks, including currently safe security patterns that could become unsafe after later edits.\n"
             "- Use evidence='missing-context' when a truncated diff or omitted file prevents verification.\n\n"
             f"{project_block}"
